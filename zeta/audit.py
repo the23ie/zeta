@@ -25,6 +25,10 @@ AGG_FAST = "count(*), coalesce(sum(total_cents), 0), 0"
 US = "('epoch'::timestamptz + %s * interval '1 microsecond')"
 
 
+class Busy(Exception):
+    """An audit is already running (the API answers 409 instead of queueing another one)."""
+
+
 class Auditor:
     def __init__(self, engine, hub, interval=60.0):
         self.engine, self.hub, self.interval = engine, hub, interval
@@ -69,8 +73,12 @@ class Auditor:
 
     # ---------- audit ----------
     def run(self, localize=False, repair=False):
-        with self.lock:
+        if not self.lock.acquire(blocking=False):
+            raise Busy("an audit is already running")
+        try:
             return self._run(localize, repair)
+        finally:
+            self.lock.release()
 
     def _run(self, localize, repair):
         t0 = time.time()
@@ -87,8 +95,7 @@ class Auditor:
             res["snapshots"][st.db] = r["snapshot"]
         res["sql_ms"] = round(res["sql_ms"], 1)
         res["snapshot"] = f"one per database ({len(streams)})"
-        res["ok"] = all(v["ok"] for v in res["tenants"].values()) or (
-            repair and bool(res["localized"]) and all(x.get("after_ok") for x in res["localized"]))
+        res["ok"] = all(v["ok"] for v in res["tenants"].values())  # after any repair
         res["took_ms"] = round((time.time() - t0) * 1000, 1)
         self.last = res
         self.history = (self.history + [{k: res[k] for k in ("at", "ok", "took_ms", "sql_ms")}])[-50:]
@@ -115,54 +122,77 @@ class Auditor:
             xmax32, xip32 = xmax & 0xFFFFFFFF, {x & 0xFFFFFFFF for x in xip}
             out = {"snapshot": f"{xmin}:{xmax}:{','.join(map(str, xip))}", "sql_ms": sql_ms,
                    "tenants": {}, "localized": []}
+            vis = (xmax32, xip32)
             with eng.lock:
-                invisible = [e for xid, e in eng.recent if xid is None or xid >= xmax32 or xid in xip32]
-                out["invisible_txns"] = len(invisible)
+                out["invisible_txns"] = len(self._invisible(vis))
                 for tid in sorted(set(db) | set(st.tids)):
-                    t = eng.tenants.get(tid)
-                    if t is None:
-                        z = [0, 0, 0]
-                    else:
-                        a, o = t.audit_range(0, t.T), t.audit_outside()
-                        z = self._minus([a[0] + o[0], a[1] + o[1], (a[2] + o[2]) % P61], self._adjust(invisible, tid))
+                    z = self._z_total(tid, vis) if tid in eng.tenants else [0, 0, 0]
                     d = db.get(tid, [0, 0, 0])
                     out["tenants"][tid] = {"ok": z == d, "db": d, "zeta": z, "database": st.db}
-                if localize:
-                    for tid, v in out["tenants"].items():
-                        if not v["ok"] and tid in eng.tenants:
-                            out["localized"].append(self._localize(cur, eng.tenants[tid], invisible, repair))
+            # The search runs its SQL *outside* the engine lock (change processing and queries keep going);
+            # every ZETA-side value is re-read under the lock with the deltas the snapshot cannot see removed.
+            if localize:
+                for tid, v in out["tenants"].items():
+                    if v["ok"] or tid not in eng.tenants:
+                        continue
+                    for _ in range(50):  # repair keeps going until the store matches again
+                        loc = self._localize(cur, tid, vis, repair)
+                        out["localized"].append(loc)
+                        if not repair or "hour" not in loc or not loc.get("after_ok"):
+                            break
+                        with eng.lock:
+                            v["zeta"] = self._z_total(tid, vis)
+                        if v["zeta"] == v["db"]:
+                            v["ok"] = v["repaired"] = True
+                            break
             return out
         finally:
             conn.rollback()
             conn.close()
 
-    def _localize(self, cur, t, invisible, repair):
-        """Binary search over hour buckets, every comparison at the audit snapshot."""
+    def _invisible(self, vis):
+        """Logged deltas of transactions the audit snapshot cannot see (call under the engine lock)."""
+        xmax32, xip32 = vis
+        return [e for xid, e in self.engine.recent if xid is None or xid >= xmax32 or xid in xip32]
+
+    def _z_total(self, tid, vis):
+        """ZETA's [count, revenue, hash] for a whole store at the audit snapshot (call under the engine lock)."""
+        t = self.engine.tenants[tid]
+        a, o = t.audit_range(0, t.T), t.audit_outside()
+        return self._minus([a[0] + o[0], a[1] + o[1], (a[2] + o[2]) % P61], self._adjust(self._invisible(vis), tid))
+
+    def _localize(self, cur, tid, vis, repair):
+        """Binary search over hour buckets for one bad hour, every comparison at the audit snapshot."""
         eng = self.engine
         n_sql = 0
+        with eng.lock:
+            t = eng.tenants[tid]
+            epoch, T = t.epoch, t.T
 
         def db_range(h0, h1, agg):
             nonlocal n_sql
             n_sql += 1
             cur.execute(f"SELECT {agg} FROM orders WHERE tenant_id = %s AND created_at >= {US} AND created_at < {US}",
-                        (t.tid, t.epoch + h0 * HOUR, t.epoch + h1 * HOUR))
+                        (tid, epoch + h0 * HOUR, epoch + h1 * HOUR))
             return [int(x) for x in cur.fetchone()]
 
         def z_range(h0, h1, fast):
-            z = self._minus(t.audit_range(h0, h1), self._adjust(invisible, t.tid, h0, h1))
+            with eng.lock:
+                z = self._minus(eng.tenants[tid].audit_range(h0, h1), self._adjust(self._invisible(vis), tid, h0, h1))
             return z[:2] + [0] if fast else z
 
         # outside the axis: those orders live only in the mirror
         cur.execute(f"SELECT {AGG} FROM orders WHERE tenant_id = %s AND (created_at < {US} OR created_at >= {US})",
-                    (t.tid, t.epoch, t.epoch + t.T * HOUR))
+                    (tid, epoch, epoch + T * HOUR))
         db_out = [int(x) for x in cur.fetchone()]
-        z_out = self._minus(t.audit_outside(), self._adjust(invisible, t.tid, outside=True))
+        with eng.lock:
+            z_out = self._minus(eng.tenants[tid].audit_outside(), self._adjust(self._invisible(vis), tid, outside=True))
         if db_out != z_out:
-            return {"tenant": t.tid, "where": "outside axis", "db": db_out, "zeta": z_out}
+            return {"tenant": tid, "where": "outside axis", "db": db_out, "zeta": z_out}
 
-        fast = db_range(0, t.T, AGG_FAST) != z_range(0, t.T, True)  # count/revenue differ: skip md5 while searching
+        fast = db_range(0, T, AGG_FAST) != z_range(0, T, True)  # count/revenue differ: skip md5 while searching
         agg = AGG_FAST if fast else AGG
-        lo, hi = 0, t.T
+        lo, hi = 0, T
         while hi - lo > 1:
             mid = (lo + hi) // 2
             if db_range(lo, mid, agg) != z_range(lo, mid, fast):
@@ -170,10 +200,11 @@ class Auditor:
             else:
                 lo = mid
         d, z = db_range(lo, lo + 1, AGG), z_range(lo, lo + 1, False)
-        out = {"tenant": t.tid, "hour": lo, "hour_start": _iso(t.epoch + lo * HOUR), "sql_queries": n_sql + 1,
+        out = {"tenant": tid, "hour": lo, "hour_start": _iso(epoch + lo * HOUR), "sql_queries": n_sql + 1,
                "db": d, "zeta": z}
         if repair:
-            out["repair"] = t.rebuild_hour(lo)
+            with eng.lock:
+                out["repair"] = eng.tenants[tid].rebuild_hour(lo)
             out["after"] = z2 = z_range(lo, lo + 1, False)
             out["after_ok"] = z2 == d
         return out
@@ -188,6 +219,8 @@ class Auditor:
             time.sleep(self.interval)
             try:
                 self.run()
+            except Busy:
+                pass  # one was started from the dashboard; skip this round
             except Exception:
                 log.exception("audit failed")
 

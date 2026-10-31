@@ -15,7 +15,8 @@ Owner routes (the company that owns every store; owner or admin key), aggregated
   GET  /owner/orders/by-status?from&to&stores
   GET  /owner/orders/trend?from&to&granularity&status&stores
   GET  /owner/products/top?from&to&n&stores
-  GET  /dashboard?key=<owner key>           the one dashboard (a store key opens it for its own store)
+  GET  /dashboard?key=<owner key>           the owner's dashboard
+  GET  /store?key=<store key>               a store owner's own dashboard (only that store's data)
 
 Analytics (owner/admin key; a store key is limited to its own store):
   GET  /analytics/summary | /analytics/stores | /analytics/explore | /analytics/heatmap
@@ -26,6 +27,9 @@ Operations (owner or admin key):
   GET  /monitor.json                        data for the dashboard's Operations tab (/monitor redirects there)
   GET  /admin/audit | POST /admin/audit?localize&repair
   POST /admin/corrupt?tenant=1              demo: damage one hour bucket
+  GET  /admin/keys[?stores=7]               each store's key and dashboard link (owner hands them out)
+  POST /admin/keys/rotate?tenant=7          new key for one store; the old one stops working
+  POST /admin/snapshot                      save a checkpoint now (also automatic, and on shutdown)
   POST /admin/rebuild[?tenant=7]            rebuild one store database (or all) from a fresh snapshot (B-2)
 
 `from`/`to` are ISO-8601 timestamps (naive = UTC), range is [from, to). Trend buckets are UTC-aligned.
@@ -46,7 +50,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from . import guard
-from .audit import Auditor
+from .audit import Auditor, Busy
 from .cdc import Hub, lsn_str, ts_to_us
 from .engine import DAY, HOUR, S_IDX, STATUSES, Engine
 
@@ -56,10 +60,14 @@ log = logging.getLogger("zeta")
 PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 DBS = os.environ.get("ZETA_DBS", "t1m_*")  # one database per store: a prefix pattern or a comma list
 AUDIT_INTERVAL = float(os.environ.get("ZETA_AUDIT_INTERVAL", "60"))
+# checkpoints: restart = load snapshot + replay WAL since it, instead of re-reading every store database
+SNAP_DIR = None if os.environ.get("ZETA_SNAPSHOTS", "1") == "0" else os.environ.get(
+    "ZETA_SNAPSHOT_DIR", str(Path(__file__).resolve().parent.parent / "snapshots"))
+SNAP_INTERVAL = float(os.environ.get("ZETA_SNAPSHOT_INTERVAL", "60"))
 MIN_US, MAX_US = -(2 ** 62), 2 ** 62
 
 engine = Engine()
-hub = Hub(engine, PG, DBS)
+hub = Hub(engine, PG, DBS, snap_root=SNAP_DIR, snap_interval=SNAP_INTERVAL)
 auditor = Auditor(engine, hub, AUDIT_INTERVAL)
 limiter = guard.Limiter()
 LAT = defaultdict(lambda: deque(maxlen=5000))
@@ -71,13 +79,17 @@ async def lifespan(app):
     t0 = time.time()
     hub.bootstrap()
     hub.start()
+    hub.start_snapshots()
     auditor.start()
     orders = sum(st.boot.get("orders", 0) for st in hub.streams.values())
-    log.info("bootstrapped %d store databases (%s), %d stores, %s orders in %.1fs", len(hub.streams), DBS,
+    resumed = sum(st.resumed for st in hub.streams.values())
+    log.info("started %d store databases (%s): %d resumed from snapshots, %d fully loaded; %d stores, "
+             "%s orders in %.1fs", len(hub.streams), DBS, resumed, len(hub.streams) - resumed,
              len(engine.tenants), f"{orders:,}", time.time() - t0)
     log.info("monitor: http://localhost:<port>/monitor?key=%s", guard.admin_key())
     log.info("owner dashboard: http://localhost:<port>/dashboard?key=%s", guard.owner_key())
     yield
+    log.info("shutdown snapshot: %s", hub.snapshot_all())  # a clean restart then replays nothing
     hub.stop()
 
 
@@ -571,6 +583,10 @@ def _health():
             "items": sum(st.boot.get("items", 0) for st in streams),
             "bootstrap_s": max((st.boot.get("bootstrap_s", 0) for st in streams), default=None),
             "max_cdc_lag_ms": max(lags) if lags else None, "audit_ok": a["ok"] if a else None,
+            "snapshots": {"enabled": SNAP_DIR is not None, "interval_s": SNAP_INTERVAL,
+                          "resumed_databases": sum(st.resumed for st in streams),
+                          "oldest_snapshot_age_s": max((round(time.time() - st.snapshot_at, 1) for st in streams
+                                                        if st.snapshot_at), default=None)},
             **{k: v for k, v in s.items() if k not in ("orders", "items", "bootstrap_s")},
             "markers": {st.db: st.last_marker for st in streams},
             "streams": [st.status() for st in streams]}
@@ -595,7 +611,10 @@ def audit_last(request: Request):
 @app.post("/admin/audit")
 def audit_now(request: Request, localize: bool = True, repair: bool = False):
     require_admin(request)
-    return auditor.run(localize=localize, repair=repair)
+    try:
+        return auditor.run(localize=localize, repair=repair)
+    except Busy:
+        raise HTTPException(409, "an audit is already running; try again in a few seconds")
 
 
 @app.post("/admin/corrupt")
@@ -607,6 +626,40 @@ def corrupt(request: Request, tenant: int = 1):
             "what": "added one phantom cancelled order to this hour bucket (Fenwick + raw)"}
 
 
+@app.get("/admin/keys")
+def store_keys(request: Request, stores: Optional[str] = None):
+    """The owner hands each store its key: key + link to that store's dashboard. Owner/admin only."""
+    require_admin(request)
+    try:
+        tids = sorted({int(x) for x in stores.split(",") if x.strip()}) if stores else sorted(engine.tenants)
+    except ValueError:
+        raise HTTPException(400, "stores must be a comma list of store ids")
+    unknown = [t for t in tids if t not in engine.tenants]
+    if unknown:
+        raise HTTPException(404, f"unknown stores {unknown}")
+    return [{"tenant_id": t, "name": engine.names.get(t), "database": engine.stream_of[t].db if t in engine.stream_of else None,
+             "key": guard.tenant_key(t), "dashboard": f"/store?key={guard.tenant_key(t)}"} for t in tids]
+
+
+@app.post("/admin/keys/rotate")
+def rotate_store_key(request: Request, tenant: int):
+    """Issue a new key for one store (e.g. it leaked); the old key stops working immediately."""
+    require_admin(request)
+    if tenant not in engine.tenants:
+        raise HTTPException(404, f"unknown store {tenant}")
+    key = guard.rotate_tenant_key(tenant)
+    log.warning("store %s key rotated; the previous key no longer works", tenant)
+    return {"tenant_id": tenant, "name": engine.names.get(tenant), "key": key, "dashboard": f"/store?key={key}",
+            "note": "the previous key for this store no longer works"}
+
+
+@app.post("/admin/snapshot")
+def snapshot_now(request: Request):
+    """Save every store database that changed since its last snapshot (also runs every ZETA_SNAPSHOT_INTERVAL s)."""
+    require_admin(request)
+    return hub.snapshot_all()
+
+
 @app.post("/admin/rebuild")
 def rebuild(request: Request, tenant: Optional[int] = None):
     """B-2: rebuild one store's database (or all) from a fresh exported snapshot; other stores keep streaming."""
@@ -614,7 +667,12 @@ def rebuild(request: Request, tenant: Optional[int] = None):
     t0 = time.time()
     if tenant is not None and tenant not in engine.stream_of:
         raise HTTPException(404, f"unknown tenant {tenant}")
-    dbs = hub.rebuild(engine.stream_of[tenant].db if tenant is not None else None)
+    try:
+        dbs = hub.rebuild(engine.stream_of[tenant].db if tenant is not None else None)
+    except RuntimeError as e:
+        if str(e) != "busy":
+            raise
+        raise HTTPException(409, "a rebuild is already running; wait for it to finish")
     return {"rebuilt": dbs, "took_s": round(time.time() - t0, 2)}
 
 
@@ -645,6 +703,12 @@ def monitor_json(request: Request):
 def dashboard():
     """The owner's dashboard page; its data calls carry the owner key."""
     return (Path(__file__).parent / "dashboard.html").read_text()
+
+
+@app.get("/store", response_class=HTMLResponse)
+def store_dashboard():
+    """A store owner's own dashboard; every data call carries that store's key, so it only ever sees its store."""
+    return (Path(__file__).parent / "store.html").read_text()
 
 
 @app.get("/monitor")

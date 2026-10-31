@@ -219,12 +219,18 @@ thread pool; one **Hub** thread reads all replication streams (`zeta/cdc.py:187-
 **Memory vs disk, and restart** [V]
 
 - Everything ZETA computes is in memory only.
-- On start, for every store database ZETA **drops its old replication slot and creates a new one** with an
-  exported snapshot, reads all rows at that snapshot, and builds everything again (`zeta/cdc.py:96-131`).
-  Nothing is resumed. Measured: the slowest store database took 49.5 s, the median 0.9 s, 100 databases
-  loaded 6 at a time (`workers=6`, `zeta/cdc.py:190, 203`). [V] (`/health` → `bootstrap_s`)
-- While ZETA is stopped, the slots still exist and are inactive, so **Postgres keeps WAL for them** until ZETA
-  starts again and drops them. A long outage would fill the disk. [V by code; the disk effect is A]
+- **Update (1 Nov, after this write-up): checkpointing was added** (`zeta/snapshot.py`, `Stream.start` in
+  `zeta/cdc.py`). Each store database's state is saved with its WAL position every 60 s, on demand and on shutdown;
+  slots are kept; Postgres is only confirmed saved positions; a restart loads the snapshots, resumes the slots,
+  skips already-counted transactions and replays the rest. Measured at 10M [V]: clean restart 1.8 s, restart after
+  a `kill -9` with 1,000 unsaved transactions 2.5 s (750/750 checks, audit green), one damaged snapshot 2.3 s
+  (that database fully reloaded, 99 resumed). With confirmations held back, 300 resent transactions were skipped
+  as already counted and 800/800 checks matched [V].
+- Without a usable snapshot (first start, damaged file, lost slot) ZETA still does the full load described here:
+  create the slot with an exported snapshot and read all rows (`Stream.bootstrap`). Measured before checkpointing:
+  the slowest store database took 49.5 s, the median 0.9 s, 6 at a time [V].
+- While ZETA is stopped, Postgres keeps WAL for its slots; this is now capped at 20 GB
+  (`max_slot_wal_keep_size`), beyond which ZETA falls back to a full load. [V]
 
 ---
 
@@ -743,8 +749,9 @@ demonstrated**: it passed once and failed once.
 
 **After a restart** [V]
 
-- Full rebuild; nothing resumes from the replication slot. While ZETA is down, Postgres retains WAL for the
-  inactive slots.
+- Fixed after this write-up: restarts resume from snapshots in about 2 s at 10M (§4). Remaining limits: snapshots
+  hold a full copy of the state (973 MB at 10M); the owner index is rebuilt on every start (seconds); WAL kept for
+  slots is capped at 20 GB.
 
 **Concurrent users** [V by code]
 
@@ -812,7 +819,7 @@ the edges exactly from a sorted row copy. The tree is a sound, modest choice, no
 ## 14. Questions a judge might ask
 
 1. **Where do writes go first?** To the store's own Postgres database. ZETA only reads committed changes from the WAL; a rolled-back transaction never reaches it. [V]
-2. **What if ZETA crashes?** Postgres is unaffected. ZETA rebuilds everything on restart (about 50 s for 10M). It does not resume, and while it is down Postgres keeps WAL for its slots. [V]
+2. **What if ZETA crashes?** Postgres is unaffected. ZETA reloads its last snapshot and replays only the WAL written since: about 2.5 s at 10M after a `kill -9`, with every check matching afterwards. Transactions already in the snapshot are skipped, so nothing is counted twice. [V]
 3. **How do you know the numbers are right?** Harness: random queries compared to SQL with zero tolerance, after random writes. Audit: every 60 s, per database, at one snapshot. [V]
 4. **What does the audit not cover?** Product sales, top-N, categories and the owner index; and the initial load's hash comes from Postgres. [V]
 5. **Can store A see store B?** No. `test_isolation.py` tries every route with wrong, forged and other stores' keys and scans every allowed response for other stores' ids: 216 checks, 0 failures. Two metadata leaks were found and fixed while preparing this document. [V]
@@ -832,7 +839,7 @@ the edges exactly from a sorted row copy. The tree is a sound, modest choice, no
 - B-4 config-driven metrics.
 - A concurrency cap per tenant (B-3 is a rate limit only).
 - A unit-test suite (an automated isolation test was added).
-- Resume after restart; overflow compaction; a rolling time axis.
+- Overflow compaction; a rolling time axis. (Resume after restart was added afterwards, §4.)
 - Audit of product sales, top-N, categories and the owner index.
 - Authentication on the demo store app (it has none); HTTPS.
 - Handling of schema changes, TRUNCATE and tenant moves in the change stream.

@@ -27,12 +27,14 @@ own queries and the owner's cross-store queries from memory, exactly.
 | Path | What |
 |---|---|
 | `split_load.py` | Loads the organisers' CSVs as **one Postgres database per store** (`t1m_001…t1m_010`, `t10m_001…t10m_100`) |
+| `zeta/snapshot.py` | Checkpoints: each store database's state + the WAL position it reflects, written atomically to `snapshots/` |
 | `zeta/cdc.py` | One `Stream` per store database (own replication slot, snapshot-exact bootstrap, freshness) and a `Hub` thread that follows all of them |
 | `zeta/engine.py` | Delta engine: per-store hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new) |
 | `zeta/owner.py` | Owner index: all-store structures (hour × store × status Fenwick, day × every-product Fenwick, one time-sorted mirror of every store's rows) kept current by the same deltas, so owner queries cost about the same for 10 or 100 stores |
 | `zeta/api.py` | FastAPI: store routes, owner routes, analytics routes, `/health`, `/markers`, admin/audit, `/dashboard` |
 | `zeta/audit.py` | Snapshot-exact audit **per store database** (ledger hash + count + revenue), binary-search localization, surgical bucket rebuild |
 | `zeta/guard.py` | Keys: store key bound to one store (FR-5), owner key for all stores, admin key; cost-aware token buckets (B-3) |
+| `zeta/store.html` | A store owner's own dashboard (`/store`): headline numbers vs previous period plus "Ask about your store" (any metric by status, category, product, day, hour, weekday), CSV download, the API call shown; only that store's data |
 | `zeta/dashboard.html` | The one dashboard: Overview (KPIs vs previous period, trend, category mix, status, top products, weekday × hour heatmap), Stores (health table, growth, sparklines, attention flags), Explore (any metric by any dimension), Operations (B-5: CDC lag, latency, per-store audit grid, repair / rebuild) |
 | `store/` | Demo store app (customer side): pick a shop, place and cancel orders, written to that shop's database |
 | `harness.py` | Correctness: random store checks (SQL in that store's DB) and owner checks (SQL in every store DB, combined) |
@@ -61,8 +63,23 @@ ZETA_HOST=0.0.0.0 ./run.sh t10m 8001   # 100 store databases (10M) on :8001, rea
 ./run_store.sh t10m               # optional: customer store app on :9000
 ```
 
-- Dashboard: `http://localhost:8001/dashboard?key=<owner key>`: the company owner sees every store plus the Operations tab;
-  a store key (`zt_…`) opens the same dashboard limited to that store (`/monitor` now redirects to the Operations tab)
+- Owner dashboard: `http://localhost:8001/dashboard?key=<owner key>`: every store, plus the Operations tab
+  (`/monitor` redirects there). Operations → **Store keys** shows any store's key and dashboard link, and rotates keys.
+- Store dashboard: `http://localhost:8001/store?key=<store key>`: a store owner sees only their own store.
+  A store key that opens `/dashboard` is sent to `/store`.
+
+Store keys (the company owner hands them out):
+
+```bash
+./keys.sh 7 12            # keys for stores 7 and 12 (plus the owner and admin keys)
+./keys.sh --all t10m      # every store's key
+./keys.sh --rotate 7      # new key for store 7; the old one stops working at once, even on a running server
+```
+
+Or over the API with the owner key: `GET /admin/keys?stores=7` and `POST /admin/keys/rotate?tenant=7`. Keys are HMACs of
+the store id and a per-store version (in `.zeta_key_versions.json`, not in git) signed with `.zeta_secret`; rotating
+bumps the version. To send a store owner a link that works from their laptop, open the owner dashboard through
+this laptop's Wi-Fi address (not `localhost`) before copying it.
 - Customer store: `http://localhost:9000/?shop=7`
 
 API (`from`/`to` ISO-8601, naive = UTC, range `[from, to)`, trend buckets UTC):
@@ -98,6 +115,26 @@ Correctness and demo:
 .venv/bin/python demo_live.py                    # store 5 on the 10M server, plus owner totals
 .venv/bin/python bench.py latency | freshness | safety
 ```
+
+### Restarts and snapshots (checkpointing)
+
+ZETA saves each store database's state with the WAL position (LSN) it reflects: every 60 s (only databases that
+changed), on `POST /admin/snapshot`, and on a clean shutdown. Replication slots are kept, and Postgres is only told
+"confirmed" for positions that are saved, so it keeps all WAL ZETA might still need. On restart ZETA loads each
+snapshot, resumes the slot, skips transactions already in the snapshot and replays the rest; the owner index is then
+rebuilt from the restored stores. A missing, damaged or unusable snapshot makes only that database fall back to a full load.
+
+| Restart (10M orders, 100 store databases) | Time to answering queries |
+|---|---|
+| full load (no snapshots) | 22–60 s |
+| clean restart (shutdown snapshot) | **1.8 s** |
+| crash (`kill -9`) after 1,000 unsaved transactions | **2.5 s**, then 750/750 checks match SQL, audit green |
+| one damaged snapshot | 2.3 s (99 resumed, 1 fully loaded) |
+
+Duplicate safety: with confirmations held back (test switch `ZETA_TEST_HOLD_CONFIRM=1`), Postgres resent 600
+transactions after a crash; ZETA skipped the 300 already in the snapshot, applied the other 300, and 800/800 checks matched.
+Settings: `ZETA_SNAPSHOT_INTERVAL` (s, default 60), `ZETA_SNAPSHOTS=0` to disable, `ZETA_SNAPSHOT_DIR`.
+Postgres caps the WAL kept for slots at 20 GB (`max_slot_wal_keep_size`); beyond that ZETA does a full load.
 
 Reload store databases: stop ZETA, then `.venv/bin/python split_load.py data_10m --prefix t10m`.
 

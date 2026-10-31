@@ -4,3 +4,5 @@ data_*/
 __pycache__/
 .zeta_secret
 .DS_Store
+.zeta_key_versions.json
+snapshots/

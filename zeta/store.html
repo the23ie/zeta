@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Store Dashboard</title>
+<style>
+  :root { --bg:#f6f6f3; --card:#fff; --ink:#1d1d1b; --ink2:#46463f; --muted:#6b6b66; --line:#e3e3de; --grid:#ececE8;
+          --bar:#2f7d5b; --soft:#e4f2ea; --flash:#fff3c4; --good:#1f8a4c; --bad:#c23b3b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#131312; --card:#1d1d1b; --ink:#ececea; --ink2:#c9c9c4; --muted:#9a9a94; --line:#33332f; --grid:#2a2a27;
+            --bar:#5fbf8c; --soft:#1d2e25; --flash:#4a3f12; --good:#4fd18b; --bad:#ff7b7b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:16px 16px 56px; }
+  header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:10px; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:15px; margin:0 0 6px; }
+  .muted { color:var(--muted); font-size:12px; }
+  .fresh { font-size:12px; color:var(--muted); text-align:right; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  select, input, button { font:inherit; }
+  select, input { padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { border:0; background:transparent; color:var(--ink2); padding:4px 10px; cursor:pointer; }
+  .seg button.on { background:var(--soft); color:var(--ink); font-weight:600; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:10px; margin:12px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; min-width:0; transition:background .6s; }
+  .card.flash { background:var(--flash); transition:none; }
+  .k { color:var(--muted); font-size:12px; } .v { font-size:22px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .d { font-size:12px; font-variant-numeric:tabular-nums; color:var(--ink2); } .up { color:var(--good); } .down { color:var(--bad); }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 12px; }
+  .chips button { border:1px solid var(--line); background:var(--card); color:var(--ink2); border-radius:99px; padding:4px 11px; cursor:pointer; font-size:13px; }
+  .chips button:hover, .chips button.on { background:var(--soft); color:var(--ink); }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:right; vertical-align:middle; }
+  td:first-child, th:first-child { text-align:left; } th { color:var(--muted); font-weight:500; font-size:12px; }
+  .barcell { width:40%; } .hbar { height:10px; background:var(--bar); border-radius:0 4px 4px 0; min-width:1px; }
+  .chart { position:relative; margin:6px 0; } svg text { fill:var(--muted); font-size:11px; }
+  .tip { position:absolute; pointer-events:none; background:var(--ink); color:var(--bg); font-size:12px; padding:5px 8px; border-radius:6px; white-space:nowrap; transform:translate(-50%, -110%); display:none; z-index:5; }
+  button.primary { background:var(--bar); color:#fff; border:0; border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--ink2); border:1px solid var(--line); border-radius:8px; padding:5px 10px; cursor:pointer; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; white-space:pre-wrap; word-break:break-all; font:12px ui-monospace, Menlo, monospace; margin:6px 0 0; }
+  details summary { cursor:pointer; color:var(--muted); font-size:12px; margin-top:8px; }
+  .scroll { max-height:360px; overflow:auto; }
+  .login { max-width:460px; margin:60px auto; } .login input { width:100%; margin:8px 0; }
+  .err { color:var(--bad); }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const $ = id => document.getElementById(id);
+const rupees = c => '₹' + (c / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const rupees0 = c => '₹' + Math.round(c / 100).toLocaleString('en-IN');
+const rupeesShort = c => { const r = c / 100; return r >= 1e7 ? '₹' + (r / 1e7).toFixed(2) + ' Cr' : r >= 1e5 ? '₹' + (r / 1e5).toFixed(2) + ' L' : rupees0(c); };
+const num = n => n.toLocaleString('en-IN');
+const pct = r => (r * 100).toFixed(1) + '%';
+const RANGES = { today: 'Today', '7d': '7 days', '30d': '30 days', '90d': '90 days' };
+const METRICS = { orders: 'Orders', revenue: 'Revenue (all orders)', net_sales: 'Net sales (excl. cancelled and returned)',
+  aov: 'Average order value', cancel_rate: 'Cancel rate', return_rate: 'Return rate', sales: 'Item sales' };
+const GROUPS = { none: 'Total', status: 'Order status', category: 'Product category', product: 'Product (top 20)',
+  day: 'Day (UTC)', hour_of_day: 'Hour of day (UTC)', weekday: 'Weekday (UTC)' };
+const QUESTIONS = [
+  ['What sells best?', 'sales', 'product'], ['Sales by category', 'sales', 'category'], ['Orders per day', 'orders', 'day'],
+  ['Revenue per day', 'revenue', 'day'], ['Busiest hours', 'orders', 'hour_of_day'], ['Busiest weekdays', 'orders', 'weekday'],
+  ['Average order value by weekday', 'aov', 'weekday'], ['When do cancellations happen?', 'cancel_rate', 'hour_of_day'],
+  ['Orders by status', 'orders', 'status'], ['Return rate per day', 'return_rate', 'day']];
+const ls = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+             del(k) { try { localStorage.removeItem(k); } catch (e) {} } };
+const params = new URLSearchParams(location.search);
+let key = params.get('key') || ls.get('zeta-store-key');
+let me = null, range = '7d', metric = 'sales', by = 'product', timer = null, prev = {}, lastRows = [];
+
+async function get(path, q = {}) {
+  const u = new URL(path, location.origin);
+  for (const [k, v] of Object.entries(q)) if (v != null && v !== '') u.searchParams.set(k, v);
+  const r = await fetch(u, { headers: { 'X-API-Key': key } });
+  const body = await r.json();
+  if (!r.ok) throw Object.assign(new Error(body.detail || r.status), { status: r.status });
+  return body;
+}
+function win() {  // calendar days in the browser's time zone
+  const from = new Date(); from.setHours(0, 0, 0, 0);
+  from.setDate(from.getDate() - ({ today: 1, '7d': 7, '30d': 30, '90d': 90 }[range] - 1));
+  const to = new Date(); to.setHours(24, 0, 0, 0);
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+function delta(ch, invert) {
+  if (ch == null) return '<span class="d">no previous data</span>';
+  const good = invert ? ch < 0 : ch > 0, arrow = ch > 0 ? '▲' : ch < 0 ? '▼' : '■';
+  return `<span class="d ${ch === 0 ? '' : good ? 'up' : 'down'}" title="vs the previous ${RANGES[range].toLowerCase()}">${arrow} ${Math.abs(ch).toFixed(1)}% vs prev. period</span>`;
+}
+function flash(id, sig) { const el = $(id); if (!el) return; if (prev[id] !== undefined && prev[id] !== sig) { el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 60); } prev[id] = sig; }
+const fmtFor = m => m.endsWith('_rate') ? pct : m === 'aov' ? rupees : ['revenue', 'net_sales', 'sales'].includes(m) ? rupees0 : num;
+const label = (row, b) => b === 'product' ? row.key.replace(/ \(store \d+\)$/, '') + ` <span class="muted">#${row.product_id}</span>` : row.key;
+
+function loginForm(msg) {
+  clearInterval(timer);
+  $('app').innerHTML = `<div class="card login"><h1>Your store dashboard</h1>
+    <p class="muted">Paste your store's API key (zt_…). It only ever shows your own store's numbers.</p>
+    <input id="k" placeholder="zt_…" value=""><button class="primary" onclick="useKey()">Open</button>
+    ${msg ? `<p class="err">${msg}</p>` : ''}</div>`;
+}
+function useKey() { key = $('k').value.trim(); ls.set('zeta-store-key', key); start(); }
+function signOut() { ls.del('zeta-store-key'); key = null; loginForm('Signed out.'); }
+
+function shell() {
+  $('app').innerHTML = `
+  <header><div><h1>${me.name} <span class="muted">store ${me.tenant_id} · ${me.tier}</span></h1>
+    <div class="muted">Live from ZETA · only your store's data · <a href="#" onclick="signOut();return false">use a different key</a></div></div>
+    <div class="fresh" id="fresh">…</div></header>
+  <div class="row"><div class="seg" id="ranges">${Object.entries(RANGES).map(([k, v]) => `<button data-r="${k}">${v}</button>`).join('')}</div></div>
+  <div class="tiles" id="kpis"></div>
+  <div class="card" id="c-explore">
+    <h2>Ask about your store</h2>
+    <div class="chips" id="qs">${QUESTIONS.map(([l, m, b], i) => `<button data-i="${i}">${l}</button>`).join('')}</div>
+    <div class="row">
+      <label class="muted" for="m">Show</label><select id="m">${Object.entries(METRICS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+      <label class="muted" for="b">by</label><select id="b">${Object.entries(GROUPS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+      <button class="primary" onclick="pickFromSelects()">Show</button>
+    </div>
+    <div class="muted" id="def" style="margin-top:8px"></div>
+    <div id="out"></div>
+    <div class="row" style="margin-top:10px"><button class="ghost" onclick="downloadCsv()">Download CSV</button><button class="ghost" onclick="copyCall()">Copy API call</button><span class="muted" id="copied"></span></div>
+    <details><summary>API call behind this answer</summary><pre id="call">–</pre></details>
+  </div>`;
+  document.querySelectorAll('#ranges button').forEach(b => b.onclick = () => { range = b.dataset.r; prev = {}; paint(); tick(); });
+  document.querySelectorAll('#qs button').forEach(b => b.onclick = () => { const [, m, g] = QUESTIONS[b.dataset.i]; metric = m; by = g; paint(); tick(); });
+  paint();
+}
+function paint() {
+  document.querySelectorAll('#ranges button').forEach(b => b.classList.toggle('on', b.dataset.r === range));
+  document.querySelectorAll('#qs button').forEach(b => { const [, m, g] = QUESTIONS[b.dataset.i]; b.classList.toggle('on', m === metric && g === by); });
+  $('m').value = metric; $('b').value = by;
+}
+function pickFromSelects() { metric = $('m').value; by = $('b').value; paint(); tick(); }
+
+function barChart(el, rows, fmt) {
+  const W = el.clientWidth || 600, H = 200, padL = 56, padB = 22, padT = 8;
+  const max = Math.max(1e-9, ...rows.map(r => r.value));
+  const nice = Math.pow(10, Math.floor(Math.log10(max))), top = Math.ceil(max / nice) * nice;
+  const n = Math.max(1, rows.length), slot = (W - padL) / n, bw = Math.max(1, slot - 2);
+  const y = v => padT + (H - padT - padB) * (1 - v / top);
+  let svg = `<svg width="${W}" height="${H}" role="img" aria-label="${METRICS[metric]} by ${GROUPS[by]}">`;
+  for (let i = 0; i <= 4; i++) { const v = top * i / 4, yy = y(v); svg += `<line x1="${padL}" x2="${W}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/><text x="${padL - 6}" y="${yy + 4}" text-anchor="end">${fmt(v)}</text>`; }
+  rows.forEach((r, i) => {
+    const x = padL + i * slot + 1, y0 = y(0), y1 = y(r.value), h = y0 - y1, rad = Math.min(4, bw / 2, h);
+    if (h > 0) svg += `<path d="M${x},${y0} V${y1 + rad} Q${x},${y1} ${x + rad},${y1} H${x + bw - rad} Q${x + bw},${y1} ${x + bw},${y1 + rad} V${y0} Z" fill="var(--bar)"/>`;
+    svg += `<rect x="${x - 1}" y="${padT}" width="${slot}" height="${H - padT - padB}" fill="transparent" data-i="${i}"/>`;
+  });
+  const every = Math.ceil(n / 10);
+  rows.forEach((r, i) => { if (i % every === 0) svg += `<text x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${r.key.replace(/^\d{4}-/, '').replace(' UTC', '')}</text>`; });
+  el.innerHTML = svg + '</svg><div class="tip"></div>';
+  const tip = el.querySelector('.tip');
+  el.querySelectorAll('rect[data-i]').forEach(rc => {
+    rc.onmousemove = e => { const r = rows[rc.dataset.i]; tip.innerHTML = `${r.key}<br><b>${fmt(r.value)}</b>`;
+      const box = el.getBoundingClientRect(); tip.style.left = (e.clientX - box.left) + 'px'; tip.style.top = (e.clientY - box.top) + 'px'; tip.style.display = 'block'; };
+    rc.onmouseleave = () => { tip.style.display = 'none'; };
+  });
+}
+function table(rows, fmt, bars) {
+  const max = Math.max(1e-9, ...rows.map(r => r.value));
+  return `<div class="scroll"><table><tr><th>${GROUPS[by]}</th>${bars ? '<th class="barcell"></th>' : ''}<th>${METRICS[metric]}</th></tr>` +
+    rows.map(r => `<tr><td>${label(r, by)}</td>${bars ? `<td class="barcell"><div class="hbar" style="width:${100 * r.value / max}%"></div></td>` : ''}<td>${fmt(r.value)}</td></tr>`).join('') + '</table></div>';
+}
+
+async function tick() {
+  const w = win(), q = { metric, by, ...w, n: 20 };
+  const u = new URL('/analytics/explore', location.origin); Object.entries(q).forEach(([k, v]) => u.searchParams.set(k, v));
+  $('call').textContent = `curl -H "X-API-Key: <your store key>" "${u.href}"`;
+  $('call').dataset.full = `curl -H "X-API-Key: ${key}" "${u.href}"`;
+  try {
+    const [sm, ex] = await Promise.all([get('/analytics/summary', w), get('/analytics/explore', q)]);
+    const k = sm.kpis, c = sm.change_pct;
+    const tiles = [['Orders', num(k.orders), delta(c.orders)], ['Revenue', rupeesShort(k.revenue), delta(c.revenue)],
+      ['Net sales', rupeesShort(k.net_sales), delta(c.net_sales)], ['Average order value', rupees(k.aov), delta(c.aov)],
+      ['Cancel rate', pct(k.cancel_rate), delta(c.cancel_rate, true)]];
+    $('kpis').innerHTML = tiles.map(([l, v, d], i) => `<div class="card" id="kpi${i}"><div class="k">${l}</div><div class="v">${v}</div>${d}</div>`).join('');
+    tiles.forEach((t, i) => flash('kpi' + i, t[1]));
+    const fmt = fmtFor(ex.metric), rows = ex.rows;
+    lastRows = rows;
+    $('def').textContent = `${METRICS[ex.metric]} by ${GROUPS[ex.by].toLowerCase()} · ${RANGES[range].toLowerCase()} · ${ex.definition} · answered in ${ex.took_ms.toFixed(1)} ms`;
+    if (!rows.length || rows.every(r => !r.value)) $('out').innerHTML = '<p class="muted">No data in this period.</p>';
+    else if (['day', 'hour_of_day', 'weekday'].includes(ex.by)) {
+      $('out').innerHTML = '<div class="chart" id="chart"></div><details><summary>Table</summary>' + table(rows, fmt, false) + '</details>';
+      barChart($('chart'), rows, fmt);
+    } else $('out').innerHTML = table(rows, fmt, true);
+    flash('c-explore', JSON.stringify(rows));
+    const f = ex.freshness || {};
+    $('fresh').innerHTML = `last change ${f.updated_s_ago == null ? '–' : f.updated_s_ago + ' s ago'} · lag ${f.max_cdc_lag_ms == null ? '–' : Math.round(f.max_cdc_lag_ms) + ' ms'}<br>refreshes every 5 s`;
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) { loginForm('That key was not accepted: ' + e.message); return; }
+    $('out').innerHTML = `<p class="err">${e.status === 429 ? 'Too many requests, slowing down' : e.message}</p>`;
+  }
+}
+function downloadCsv() {
+  const esc = s => `"${String(s).replace(/"/g, '""')}"`;
+  const csv = [`${GROUPS[by]},${METRICS[metric]}`].concat(lastRows.map(r => `${esc(r.key)},${r.value}`)).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = `store-${me.tenant_id}-${metric}-by-${by}-${range}.csv`; a.click();
+}
+async function copyCall() {
+  try { await navigator.clipboard.writeText($('call').dataset.full); $('copied').textContent = 'copied (includes your key)'; }
+  catch (e) { $('copied').textContent = 'copy failed'; }
+}
+async function start() {
+  clearInterval(timer);
+  if (!key) { loginForm(''); return; }
+  if (!/^zt_\d+_/.test(key)) { loginForm('This page is for store keys (zt_…). The company owner uses <a href="/dashboard">/dashboard</a>.'); return; }
+  ls.set('zeta-store-key', key);
+  if (params.get('key')) history.replaceState(null, '', '/store');
+  try { me = (await get('/owner/stores'))[0]; } catch (e) { loginForm('That key was not accepted: ' + e.message); return; }
+  shell(); tick(); timer = setInterval(tick, 5000);
+}
+start();
+</script>
+</body>
+</html>

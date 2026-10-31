@@ -24,7 +24,7 @@ from zeta.guard import owner_key, tenant_key
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-PUBLIC = {"/dashboard", "/monitor", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
+PUBLIC = {"/dashboard", "/store", "/monitor", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
 HEALTH = "/health"  # public liveness only: {"ok": ...}
 W = {"from": "2026-10-24T09:00:00Z", "to": "2026-10-31T09:00:00Z"}
 

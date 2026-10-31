@@ -33,6 +33,7 @@
   .k { color:var(--muted); font-size:12px; } .v { font-size:22px; font-weight:650; font-variant-numeric:tabular-nums; }
   .d { font-size:12px; font-variant-numeric:tabular-nums; color:var(--ink2); }
   .up { color:var(--good); } .down { color:var(--bad); }
+  button:disabled, select:disabled { opacity:.45; cursor:default; }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:12px; margin-bottom:12px; }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:12px; }
   @media (max-width:900px) { .grid2, .grid3 { grid-template-columns:1fr; } }
@@ -327,22 +328,87 @@ function opsShell() {
     <div class="card"><h2>Query latency (server side, last 5000 per route)</h2><table id="op-lat"></table><p class="muted" id="op-info"></p></div>
     <div class="card"><h2>Audit: ZETA vs each store database at one MVCC snapshot</h2>
       <div class="cells" id="op-cells"></div><div class="muted" id="op-audit">no audit yet</div>
-      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
-        <button class="primary" onclick="act('POST','/admin/audit?localize=true')">Run audit</button>
+      <div id="op-actions" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+        <button class="primary" onclick="act('audit', '/admin/audit?localize=true')">Run audit</button>
         <select id="op-store">${stores.map(s => `<option value="${s.tenant_id}">store ${s.tenant_id}</option>`).join('')}</select>
-        <button class="danger" onclick="act('POST','/admin/corrupt?tenant='+$('op-store').value)">Corrupt a bucket</button>
-        <button class="primary" onclick="act('POST','/admin/audit?localize=true&repair=true')">Audit, localize, repair</button>
-        <button class="ghost" onclick="act('POST','/admin/rebuild?tenant='+$('op-store').value)">Rebuild this store's database</button>
-        <button class="ghost" onclick="if(confirm('Rebuild every store database from scratch?')) act('POST','/admin/rebuild')">Full rebuild</button>
+        <button class="danger" onclick="act('corrupt', '/admin/corrupt?tenant='+$('op-store').value)">Corrupt a bucket</button>
+        <button class="primary" onclick="act('repair', '/admin/audit?localize=true&repair=true')">Audit, localize, repair</button>
+        <button class="ghost" onclick="act('rebuild', '/admin/rebuild?tenant='+$('op-store').value)">Rebuild this store's database</button>
+        <button class="ghost" onclick="if(confirm('Rebuild every store database from scratch? This takes 30-60 s; dashboards keep working meanwhile.')) act('rebuild', '/admin/rebuild')">Full rebuild</button>
+        <button class="ghost" onclick="act('snapshot', '/admin/snapshot')">Save snapshot now</button>
       </div></div>
   </div>
-  <div class="card"><h2>Last action</h2><pre id="op-out">–</pre></div>`;
+  <div class="card" style="margin-bottom:12px"><h2>Store keys</h2>
+    <div class="muted" style="margin-bottom:8px">Each store owner signs in to their own dashboard with their store's key, and only ever sees that store. Rotate a key if it leaks: the old key stops working immediately.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+      <select id="key-store">${stores.map(s => `<option value="${s.tenant_id}">store ${s.tenant_id} · ${s.name}</option>`).join('')}</select>
+      <button class="primary" onclick="showKey()">Show key and dashboard link</button>
+      <button class="danger" onclick="rotateKey()">Rotate key</button>
+    </div>
+    <div id="key-out" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Last action</h2><div id="op-status" class="muted">No action yet.</div>
+    <details style="margin-top:6px"><summary class="muted">Raw response</summary><pre id="op-out">–</pre></details></div>`;
 }
-async function act(method, path) {
-  $('op-out').textContent = method + ' ' + path + ' …';
+function keyBox(k) {
+  const link = location.origin + k.dashboard;
+  $('key-out').innerHTML = `<table><tr><td>store</td><td style="text-align:left">${k.tenant_id} · ${k.name}${k.note ? ` <span class="flag">(${k.note})</span>` : ''}</td></tr>
+    <tr><td>API key</td><td style="text-align:left"><code>${k.key}</code></td></tr>
+    <tr><td>dashboard link</td><td style="text-align:left"><a href="${link}" target="_blank" rel="noopener">${link}</a></td></tr></table>
+    <button class="ghost" style="margin-top:6px" onclick="navigator.clipboard.writeText('${link}').then(() => this.textContent = 'Link copied')">Copy link</button>`;
+}
+async function showKey() {
+  try { keyBox((await get('/admin/keys', { stores: $('key-store').value }))[0]); } catch (e) { $('key-out').innerHTML = `<span class="err">${e.message}</span>`; }
+}
+async function rotateKey() {
+  const t = $('key-store').value;
+  if (!confirm(`Issue a new key for store ${t}? Its current key stops working immediately.`)) return;
+  try { keyBox(await get('/admin/keys/rotate', { tenant: t }, 'POST')); } catch (e) { $('key-out').innerHTML = `<span class="err">${e.message}</span>`; }
+}
+const ACTION_TEXT = { audit: 'Running the audit on every store database (about 10 s)',
+  repair: 'Auditing, finding the damaged hours and repairing them (about 10-20 s)', corrupt: 'Damaging one hour of the store',
+  rebuild: 'Rebuilding from a fresh snapshot of the database', snapshot: 'Saving snapshots' };
+const when = iso => new Date(iso).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+function summary(kind, r) {
+  if (kind === 'audit' || kind === 'repair') {
+    const bad = Object.entries(r.tenants).filter(([, v]) => !v.ok).map(([t]) => t);
+    const fixed = Object.entries(r.tenants).filter(([, v]) => v.repaired).map(([t]) => t);
+    let txt = r.ok ? `<b class="up">Audit green</b>: all ${r.databases} store databases match ZETA exactly`
+                   : `<b class="down">Audit red</b>: store${bad.length > 1 ? 's' : ''} ${bad.join(', ')} ${bad.length > 1 ? "don't" : "doesn't"} match`;
+    txt += ` · ${(r.took_ms / 1000).toFixed(1)} s`;
+    const byStore = {};
+    for (const l of r.localized || []) (byStore[l.tenant] = byStore[l.tenant] || []).push(l);
+    for (const [t, ls] of Object.entries(byStore)) {
+      const hours = ls.filter(l => l.hour_start).map(l => when(l.hour_start));
+      txt += `<br>Store ${t}: found ${hours.length} damaged hour${hours.length > 1 ? 's' : ''} (${hours.join(', ')}) with ${ls.reduce((a, l) => a + (l.sql_queries || 0), 0)} range queries`;
+      txt += fixed.includes(t) ? ' → <b class="up">repaired, now matches</b>' : kind === 'audit' ? ' → press "Audit, localize, repair" to fix' : ' → <b class="down">not fixed</b>';
+    }
+    return txt;
+  }
+  if (kind === 'corrupt') return `Damaged store ${r.tenant}, hour ${when(r.hour_start)} (added one phantom cancelled order). Run an audit to catch it.`;
+  if (kind === 'rebuild') return `<b class="up">Rebuilt</b> ${r.rebuilt.length === 1 ? r.rebuilt[0] : r.rebuilt.length + ' store databases'} in ${r.took_s} s`;
+  if (kind === 'snapshot') return `<b class="up">Snapshots saved</b>: ${r.saved} database${r.saved === 1 ? '' : 's'} written, ${r.skipped} unchanged, ${r.seconds} s`;
+  return 'Done';
+}
+let running = false;
+async function act(kind, path) {
+  if (running) return;
+  running = true;
+  const buttons = document.querySelectorAll('#op-actions button, #op-actions select');
+  buttons.forEach(b => b.disabled = true);
   const t0 = performance.now();
-  try { const r = await get(path, {}, method); $('op-out').textContent = `${method} ${path} → ${Math.round(performance.now() - t0)} ms\n\n` + JSON.stringify(r, null, 2); }
-  catch (e) { $('op-out').textContent = `${method} ${path} failed: ${e.message}`; }
+  const tick = () => $('op-status').innerHTML = `${ACTION_TEXT[kind]}… ${((performance.now() - t0) / 1000).toFixed(0)} s`;
+  tick(); const clock = setInterval(tick, 500);
+  try {
+    const r = await get(path, {}, 'POST');
+    $('op-status').innerHTML = summary(kind, r);
+    $('op-out').textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    $('op-status').innerHTML = `<span class="err">${e.status === 409 ? e.message : 'Failed: ' + e.message}</span>`;
+    $('op-out').textContent = String(e.message);
+  } finally {
+    clearInterval(clock); running = false;
+    buttons.forEach(b => b.disabled = false);
+  }
   tickOps();
 }
 async function tickOps() {
@@ -372,7 +438,8 @@ async function start() {
   ls.set('zeta-key', key);
   if (params.get('key')) history.replaceState(null, '', '/dashboard' + location.hash);
   const m = /^zt_(\d+)_/.exec(key);
-  role = m ? 'store' : 'owner'; myStore = m ? Number(m[1]) : null;
+  if (m) { ls.set('zeta-store-key', key); location.replace('/store'); return; }  // store owners have their own page
+  role = 'owner'; myStore = null;
   try { stores = role === 'owner' ? await get('/owner/stores') : []; } catch (e) { loginForm('That key was not accepted: ' + e.message); return; }
   shell();
   const want = location.hash.slice(1);

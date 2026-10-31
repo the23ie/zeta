@@ -87,6 +87,13 @@ class Fenwick:
     def grow_cols(self, extra):
         self.tree = np.pad(self.tree, ((0, 0), (0, extra)))
 
+    @classmethod
+    def from_tree(cls, tree):
+        """Rebuild the object around an already-built tree (from a snapshot): no O(n) build."""
+        f = cls.__new__(cls)
+        f.n, f.tree = tree.shape[0], tree
+        return f
+
     def to_raw(self):
         """Inverse of the build: recover the per-bucket array from the tree."""
         r = self.tree.copy()
@@ -529,6 +536,13 @@ class Engine:
             t.day = Fenwick(raw)
             tenants_new[tid] = t
 
+        self._install(tenants_new, dict(zip(tenants["tid"].tolist(), tenants["tier"])),
+                      dict(zip(tenants["tid"].tolist(), tenants["name"])), stream)
+        return {"orders": int(len(o["oid"])), "items": int(len(it["oid"])),
+                "bootstrap_s": round(time.time() - t0, 2), "read_s": round(t_read, 2)}
+
+    def _install(self, tenants_new, tiers, names, stream):
+        """Merge freshly built (or restored) stores into the engine."""
         with self.lock:
             rebuilt = set(tenants_new)
             if self.owner is not None:  # stale until rebuilt: owner queries use the per-store path meanwhile
@@ -536,9 +550,11 @@ class Engine:
                 self.owner = None
             self.tenants.update(tenants_new)
             if not self.T:
-                self.epoch, self.T = epoch, T
-            self.tiers.update(zip(tenants["tid"].tolist(), tenants["tier"]))
-            self.names.update(zip(tenants["tid"].tolist(), tenants["name"]))
+                t = next(iter(tenants_new.values()), None)
+                if t is not None:
+                    self.epoch, self.T = t.epoch, t.T
+            self.tiers.update(tiers)
+            self.names.update(names)
             if stream is not None:
                 stream.tids = sorted(rebuilt)
                 for tid in rebuilt:
@@ -547,8 +563,54 @@ class Engine:
             self.recent = deque(((x, [e for e in es if e[0] not in rebuilt]) for x, es in self.recent),
                                 maxlen=self.recent.maxlen)
             self.stats["bootstrapped_at"] = time.time()
-        return {"orders": int(len(o["oid"])), "items": int(len(it["oid"])),
-                "bootstrap_s": round(time.time() - t0, 2), "read_s": round(t_read, 2)}
+
+    # ---------- checkpoints (zeta/snapshot.py writes and reads the files) ----------
+    ARRAYS = ("hour_raw", "hb", "pid_arr", "pid_cat", "b_created", "b_oid", "b_status", "b_total", "b_ptr",
+              "i_pidx", "i_sales", "i_line", "b_oid_sorted", "b_oid_pos")
+
+    def capture(self, stream):
+        """Copy everything needed to restore this store database's stores, consistent with
+        stream.applied_lsn. Holds the engine lock only while copying (no I/O)."""
+        with self.lock:
+            out = {"lsn": stream.applied_lsn, "categories": list(self.categories), "stores": {}}
+            for tid in stream.tids:
+                t = self.tenants[tid]
+                arrays = {k: getattr(t, k).copy() for k in self.ARRAYS}
+                arrays["hour_tree"] = t.hour.tree.copy()
+                arrays["day_tree"] = t.day.tree.copy()
+                out["stores"][tid] = {
+                    "arrays": arrays,
+                    "meta": {"epoch": t.epoch, "T": t.T, "h_out": t.h_out, "pid_names": list(t.pid_names),
+                             "tier": self.tiers.get(tid), "name": self.names.get(tid),
+                             "orders": int((t.b_status != DELETED).sum()) + len(t.ov),
+                             # orders written after startup: [created_us, status, total, {line: [pidx, sales]}]
+                             "ov": {str(oid): [o[0], o[1], o[2], {str(l): list(v) for l, v in o[3].items()}]
+                                    for oid, o in t.ov.items()}}}
+            return out
+
+    def restore(self, snap, stream):
+        """Install stores from a snapshot (the inverse of capture)."""
+        t0 = time.time()
+        codes = np.array([self.cat_code(c) for c in snap["categories"]], np.int16)  # codes can differ per run
+        tenants_new, tiers, names, orders = {}, {}, {}, 0
+        for tid, st in snap["stores"].items():
+            a, m = st["arrays"], st["meta"]
+            t = Tenant(tid, m["epoch"], m["T"])
+            for k in self.ARRAYS:
+                setattr(t, k, a[k])
+            t.pid_cat = codes[a["pid_cat"]] if len(a["pid_cat"]) else a["pid_cat"]
+            t.hour = Fenwick.from_tree(a["hour_tree"])
+            t.day = Fenwick.from_tree(a["day_tree"])
+            t.h_out = int(m["h_out"])
+            t.pid_names = list(m["pid_names"])
+            t.pid_index = {int(p): i for i, p in enumerate(t.pid_arr)}
+            t.ov = {int(oid): [o[0], o[1], o[2], {int(l): tuple(v) for l, v in o[3].items()}] for oid, o in m["ov"].items()}
+            t.ov_keys = sorted((o[0], oid) for oid, o in t.ov.items())
+            tenants_new[tid], tiers[tid], names[tid] = t, m["tier"], m["name"]
+            orders += m["orders"]
+        self._install(tenants_new, tiers, names, stream)
+        return {"orders": orders, "items": int(sum(len(t.i_sales) for t in tenants_new.values())),
+                "bootstrap_s": round(time.time() - t0, 2), "restored": True}
 
     def cat_code(self, name):
         with self.lock:
