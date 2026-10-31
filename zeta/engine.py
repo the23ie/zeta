@@ -1,0 +1,517 @@
+"""ZETA delta engine.
+
+Per tenant:
+  * hourly Fenwick over vectors [count|revenue] x status            (FR-1, FR-2, FR-4)
+  * daily Fenwick over dense product-sales vectors                   (FR-3)
+  * an in-memory columnar mirror of orders/items, sorted by created_at,
+    used only for the two partial-bucket "edges" of a range query and for
+    join state (which items belong to an order when its status changes).
+
+Every change is applied as a Z-set delta: INSERT -> +new, DELETE -> -old,
+UPDATE -> -old +new. All aggregates are sums, so retractions are exact.
+Time is int64 microseconds since the Unix epoch, buckets are UTC-aligned.
+"""
+import bisect
+import io
+import threading
+import time
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.csv as pacsv
+
+STATUSES = ("placed", "shipped", "delivered", "cancelled", "returned")
+S_IDX = {s: i for i, s in enumerate(STATUSES)}
+NS = len(STATUSES)
+DELETED = NS  # mirror-only marker: base row moved to overflow or deleted
+# statuses whose items count toward product sales (index DELETED is never counted)
+COUNTED = np.array([True, True, True, False, False, False])
+HOUR = 3_600_000_000
+DAY = 24 * HOUR
+
+
+class Fenwick:
+    """Binary indexed tree over axis 0 of an int64 array; each node may be a vector."""
+
+    def __init__(self, raw):
+        n = raw.shape[0]
+        tree = raw.astype(np.int64, copy=True)
+        for i in range(1, n + 1):
+            j = i + (i & -i)
+            if j <= n:
+                tree[j - 1] += tree[i - 1]
+        self.n, self.tree = n, tree
+
+    def add(self, i, delta):
+        i += 1
+        while i <= self.n:
+            self.tree[i - 1] += delta
+            i += i & -i
+
+    def prefix(self, i):
+        s = np.zeros(self.tree.shape[1:], np.int64)
+        while i > 0:
+            s += self.tree[i - 1]
+            i -= i & -i
+        return s
+
+    def range(self, a, b):
+        return self.prefix(b) - self.prefix(a)
+
+    def grow_cols(self, extra):
+        self.tree = np.pad(self.tree, ((0, 0), (0, extra)))
+
+
+def _ceil_div(a, b):
+    return -(-a // b)
+
+
+class Tenant:
+    def __init__(self, tid, epoch, T):
+        self.tid = tid
+        self.epoch, self.T, self.D = epoch, T, T // 24
+        self.hour_raw = np.zeros((T, 2, NS), np.int64)
+        self.hour = Fenwick(self.hour_raw)
+        self.pid_arr = np.zeros(0, np.int64)
+        self.pid_names = []
+        self.pid_index = {}
+        self.day = Fenwick(np.zeros((self.D, 0), np.int64))
+        # base mirror (sorted by created_us); rows are never inserted, only flagged DELETED
+        self.b_created = np.zeros(0, np.int64)
+        self.b_oid = np.zeros(0, np.int64)
+        self.b_status = np.zeros(0, np.int8)
+        self.b_total = np.zeros(0, np.int64)
+        self.b_ptr = np.zeros(1, np.int64)
+        self.i_pidx = np.zeros(0, np.int64)
+        self.i_sales = np.zeros(0, np.int64)
+        self.i_line = np.zeros(0, np.int16)
+        self.b_oid_sorted = np.zeros(0, np.int64)
+        self.b_oid_pos = np.zeros(0, np.int64)
+        # overflow mirror: orders inserted (or moved) after bootstrap
+        self.ov = {}        # oid -> [created_us, status, total, {line: (pidx, sales)}]
+        self.ov_keys = []   # sorted [(created_us, oid)]
+
+    # ---------- products ----------
+    def set_products(self, pids, names):
+        self.pid_arr = np.asarray(pids, np.int64)
+        self.pid_names = list(names)
+        self.pid_index = {int(p): i for i, p in enumerate(self.pid_arr)}
+
+    def pidx_of(self, pid, name=None):
+        i = self.pid_index.get(pid)
+        if i is None:
+            i = len(self.pid_arr)
+            self.pid_arr = np.append(self.pid_arr, np.int64(pid))
+            self.pid_names.append(name or f"product_{pid}")
+            self.pid_index[pid] = i
+            self.day.grow_cols(1)
+        elif name is not None:
+            self.pid_names[i] = name
+        return i
+
+    @property
+    def P(self):
+        return len(self.pid_arr)
+
+    # ---------- mirror ----------
+    def find(self, oid):
+        o = self.ov.get(oid)
+        if o is not None:
+            return o, None
+        k = np.searchsorted(self.b_oid_sorted, oid)
+        if k < len(self.b_oid_sorted) and self.b_oid_sorted[k] == oid:
+            pos = int(self.b_oid_pos[k])
+            if self.b_status[pos] != DELETED:
+                return None, pos
+        return None, None
+
+    def base_items(self, pos):
+        a, b = self.b_ptr[pos], self.b_ptr[pos + 1]
+        return list(zip(self.i_pidx[a:b].tolist(), self.i_sales[a:b].tolist()))
+
+    def promote(self, pos):
+        """Move a base row to the overflow mirror so its items/created_at can change."""
+        a, b = self.b_ptr[pos], self.b_ptr[pos + 1]
+        items = {int(l): (int(p), int(s)) for l, p, s in
+                 zip(self.i_line[a:b], self.i_pidx[a:b], self.i_sales[a:b])}
+        o = [int(self.b_created[pos]), int(self.b_status[pos]), int(self.b_total[pos]), items]
+        self.b_status[pos] = DELETED
+        oid = int(self.b_oid[pos])
+        self.ov[oid] = o
+        bisect.insort(self.ov_keys, (o[0], oid))
+        return o
+
+    def ov_add(self, oid, o):
+        self.ov[oid] = o
+        bisect.insort(self.ov_keys, (o[0], oid))
+
+    def ov_remove(self, oid):
+        o = self.ov.pop(oid)
+        k = bisect.bisect_left(self.ov_keys, (o[0], oid))
+        del self.ov_keys[k]
+        return o
+
+    def _ov_range(self, a, b):
+        lo = bisect.bisect_left(self.ov_keys, (a,))
+        hi = bisect.bisect_left(self.ov_keys, (b,))
+        return [self.ov[oid] for _, oid in self.ov_keys[lo:hi]]
+
+    # ---------- Z-set deltas into the aggregates ----------
+    def hour_delta(self, created, status, total, sign):
+        h = (created - self.epoch) // HOUR
+        if not 0 <= h < self.T:
+            return  # outside the bucket axis: served from the mirror only
+        v = np.zeros((2, NS), np.int64)
+        v[0, status] = sign
+        v[1, status] = sign * total
+        self.hour_raw[h] += v
+        self.hour.add(h, v)
+
+    def prod_delta(self, created, items, sign):
+        d = (created - self.epoch) // DAY
+        if not items or not 0 <= d < self.D:
+            return
+        v = np.zeros(self.P, np.int64)
+        for pidx, sales in items:
+            v[pidx] += sign * sales
+        self.day.add(d, v)
+
+    # ---------- edges (exact partial buckets from the mirror) ----------
+    def edge_status(self, a, b):
+        v = np.zeros((2, NS), np.int64)
+        if b <= a:
+            return v
+        lo = np.searchsorted(self.b_created, a, "left")
+        hi = np.searchsorted(self.b_created, b, "left")
+        if hi > lo:
+            st = self.b_status[lo:hi]
+            v[0] = np.bincount(st, minlength=NS + 1)[:NS]
+            v[1] = np.bincount(st, weights=self.b_total[lo:hi], minlength=NS + 1)[:NS].astype(np.int64)
+        for o in self._ov_range(a, b):
+            v[0, o[1]] += 1
+            v[1, o[1]] += o[2]
+        return v
+
+    def edge_products(self, a, b):
+        v = np.zeros(self.P, np.int64)
+        if b <= a:
+            return v
+        lo = np.searchsorted(self.b_created, a, "left")
+        hi = np.searchsorted(self.b_created, b, "left")
+        ia, ib = self.b_ptr[lo], self.b_ptr[hi]
+        if ib > ia:
+            ost = np.repeat(self.b_status[lo:hi], np.diff(self.b_ptr[lo:hi + 1]))
+            m = COUNTED[ost]
+            v[:] = np.bincount(self.i_pidx[ia:ib][m], weights=self.i_sales[ia:ib][m],
+                               minlength=self.P).astype(np.int64)
+        for o in self._ov_range(a, b):
+            if COUNTED[o[1]]:
+                for pidx, sales in o[3].values():
+                    v[pidx] += sales
+        return v
+
+    # ---------- range decomposition ----------
+    def _split(self, f, t):
+        """Split [f, t) into (outside-axis parts, axis part [f2, t2))."""
+        lo_ax, hi_ax = self.epoch, self.epoch + self.T * HOUR
+        f2, t2 = max(f, lo_ax), min(t, hi_ax)
+        outside = [(f, min(t, lo_ax)), (max(f, hi_ax), t)]
+        return outside, f2, t2
+
+    def range_status(self, f, t):
+        outside, f2, t2 = self._split(f, t)
+        v = sum((self.edge_status(a, b) for a, b in outside), np.zeros((2, NS), np.int64))
+        if t2 <= f2:
+            return v
+        h0 = _ceil_div(f2 - self.epoch, HOUR)
+        h1 = (t2 - self.epoch) // HOUR
+        if h0 >= h1:
+            return v + self.edge_status(f2, t2)
+        return (v + self.hour.range(h0, h1)
+                + self.edge_status(f2, self.epoch + h0 * HOUR)
+                + self.edge_status(self.epoch + h1 * HOUR, t2))
+
+    def range_products(self, f, t):
+        outside, f2, t2 = self._split(f, t)
+        v = sum((self.edge_products(a, b) for a, b in outside), np.zeros(self.P, np.int64))
+        if t2 <= f2:
+            return v
+        d0 = _ceil_div(f2 - self.epoch, DAY)
+        d1 = (t2 - self.epoch) // DAY
+        if d0 >= d1:
+            return v + self.edge_products(f2, t2)
+        return (v + self.day.range(d0, d1)
+                + self.edge_products(f2, self.epoch + d0 * DAY)
+                + self.edge_products(self.epoch + d1 * DAY, t2))
+
+    def trend(self, f, t, step):
+        """Buckets aligned to `step` (HOUR or DAY, UTC) intersected with [f, t) on the axis.
+        Returns (bucket_starts_us, vectors[n, 2, NS])."""
+        outside, f2, t2 = self._split(f, t)
+        extra = {}  # orders moved outside the axis live only in the overflow mirror
+        for a, b in outside:
+            for o in self._ov_range(a, b):
+                v = extra.setdefault(self.epoch + (o[0] - self.epoch) // step * step, np.zeros((2, NS), np.int64))
+                v[0, o[1]] += 1
+                v[1, o[1]] += o[2]
+        starts, vals = self._axis_trend(f2, t2, step)
+        if extra:
+            keys = sorted(extra)
+            starts = np.concatenate([starts, np.array(keys, np.int64)])
+            vals = np.concatenate([vals, np.stack([extra[k] for k in keys])])
+            order = np.argsort(starts, kind="stable")
+            starts, vals = starts[order], vals[order]
+        return starts, vals
+
+    def _axis_trend(self, f2, t2, step):
+        if t2 <= f2:
+            return np.zeros(0, np.int64), np.zeros((0, 2, NS), np.int64)
+        m = step // HOUR
+        b0 = (f2 - self.epoch) // step
+        b1 = _ceil_div(t2 - self.epoch, step)
+        vals = self.hour_raw[b0 * m:b1 * m].reshape(b1 - b0, m, 2, NS).sum(axis=1)
+        starts = self.epoch + np.arange(b0, b1, dtype=np.int64) * step
+        if f2 > starts[0]:
+            vals[0] = self.edge_status(f2, min(int(starts[0]) + step, t2))
+        last_end = int(starts[-1]) + step
+        if t2 < last_end and (b1 - b0 > 1 or f2 == starts[0]):
+            vals[-1] = self.edge_status(max(int(starts[-1]), f2), t2)
+        return starts, vals
+
+
+class Engine:
+    def __init__(self, headroom_days=60, lead_days=30):
+        self.lock = threading.RLock()
+        self.headroom_days, self.lead_days = headroom_days, lead_days
+        self.tenants = {}
+        self.epoch = 0
+        self.T = 0
+        self.stats = dict(bootstrapped_at=None, bootstrap_s=None, applied_lsn=0, last_xid=None,
+                          last_commit_ts=None, last_apply_wall=None, lag_ms=None,
+                          txns=0, changes=0, last_marker=None, errors=0, last_error=None)
+
+    # ---------- bootstrap ----------
+    @staticmethod
+    def _copy(cur, sql, names, types=None):
+        buf = io.BytesIO()
+        cur.copy_expert(f"COPY ({sql}) TO STDOUT WITH (FORMAT csv)", buf)
+        if buf.tell() == 0:
+            return {n: np.zeros(0, np.int64) if (types or {}).get(n) is None else [] for n in names}
+        buf.seek(0)
+        ct = {n: (types or {}).get(n, pa.int64()) for n in names}
+        tbl = pacsv.read_csv(buf, read_options=pacsv.ReadOptions(column_names=names),
+                             convert_options=pacsv.ConvertOptions(column_types=ct))
+        return {n: (tbl[n].to_numpy() if ct[n] == pa.int64() else tbl[n].to_pylist()) for n in names}
+
+    def bootstrap(self, cur):
+        """Build all state from the snapshot `cur` is reading in."""
+        t0 = time.time()
+        status_case = "CASE status " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(STATUSES)) + " END"
+        tenants = self._copy(cur, "SELECT tenant_id FROM tenants", ["tid"])
+        prods = self._copy(cur, "SELECT product_id, tenant_id, name FROM products ORDER BY tenant_id, product_id",
+                           ["pid", "tid", "name"], {"name": pa.string()})
+        o = self._copy(cur, f"SELECT order_id, tenant_id, {status_case}, total_cents, "
+                            f"(extract(epoch FROM created_at) * 1000000)::bigint FROM orders",
+                       ["oid", "tid", "st", "tot", "cr"])
+        it = self._copy(cur, "SELECT order_id, line_no, product_id, qty::bigint * price_cents FROM order_items",
+                        ["oid", "line", "pid", "sales"])
+        t_read = time.time() - t0
+
+        if len(o["cr"]):
+            lo, hi = int(o["cr"].min()), int(o["cr"].max())
+        else:
+            lo = hi = int(time.time() * 1e6)
+        epoch = (lo // DAY - self.lead_days) * DAY  # room for late / backdated orders
+        D = (hi - epoch) // DAY + 1 + self.headroom_days
+        T = D * 24
+
+        # sort orders by (tenant, created, order_id); lay items out in that order (CSR)
+        order = np.lexsort((o["oid"], o["cr"], o["tid"]))
+        o = {k: v[order] for k, v in o.items()}
+        by_id = np.argsort(o["oid"], kind="stable")
+        k = np.searchsorted(o["oid"][by_id], it["oid"])
+        ipos = by_id[k]
+        iorder = np.lexsort((it["line"], ipos))
+        ipos = ipos[iorder]
+        it = {kk: v[iorder] for kk, v in it.items()}
+        ptr = np.concatenate([[0], np.cumsum(np.bincount(ipos, minlength=len(o["oid"])))]).astype(np.int64)
+
+        prod_tid = prods["tid"]
+        tenants_new = {}
+        for tid in sorted(set(tenants["tid"].tolist()) | set(o["tid"].tolist())):
+            t = Tenant(tid, epoch, T)
+            pa_, pb = np.searchsorted(prod_tid, tid, "left"), np.searchsorted(prod_tid, tid, "right")
+            t.set_products(prods["pid"][pa_:pb], prods["name"][pa_:pb])
+            lo_, hi_ = np.searchsorted(o["tid"], tid, "left"), np.searchsorted(o["tid"], tid, "right")
+            ia, ib = ptr[lo_], ptr[hi_]
+            t.b_created = o["cr"][lo_:hi_].copy()
+            t.b_oid = o["oid"][lo_:hi_].copy()
+            t.b_status = o["st"][lo_:hi_].astype(np.int8)
+            t.b_total = o["tot"][lo_:hi_].copy()
+            t.b_ptr = ptr[lo_:hi_ + 1] - ia
+            t.i_line = it["line"][ia:ib].astype(np.int16)
+            t.i_sales = it["sales"][ia:ib].copy()
+            item_pids = it["pid"][ia:ib]
+            if t.P:
+                pidx = np.searchsorted(t.pid_arr, item_pids).clip(0, t.P - 1)
+                bad = t.pid_arr[pidx] != item_pids
+            else:
+                pidx = np.zeros(len(item_pids), np.int64)
+                bad = np.ones(len(item_pids), bool)
+            for j in np.flatnonzero(bad):  # item references a product of another tenant / unknown
+                pidx[j] = t.pidx_of(int(item_pids[j]))
+            t.i_pidx = pidx.astype(np.int64)
+            t.b_oid_pos = np.argsort(t.b_oid, kind="stable")
+            t.b_oid_sorted = t.b_oid[t.b_oid_pos]
+
+            # hourly [count|revenue] x status
+            h = (t.b_created - epoch) // HOUR
+            idx = h * NS + t.b_status
+            t.hour_raw[:, 0, :] = np.bincount(idx, minlength=T * NS).reshape(T, NS)
+            t.hour_raw[:, 1, :] = np.bincount(idx, weights=t.b_total, minlength=T * NS).astype(np.int64).reshape(T, NS)
+            t.hour = Fenwick(t.hour_raw)
+            # daily product sales (counted statuses only)
+            P = t.P
+            counts = np.diff(t.b_ptr)
+            d_item = np.repeat((t.b_created - epoch) // DAY, counts)
+            m = COUNTED[np.repeat(t.b_status, counts)]
+            raw = np.bincount(d_item[m] * P + t.i_pidx[m], weights=t.i_sales[m],
+                              minlength=t.D * P).astype(np.int64).reshape(t.D, P) if P else np.zeros((t.D, 0), np.int64)
+            t.day = Fenwick(raw)
+            tenants_new[tid] = t
+
+        with self.lock:
+            self.tenants, self.epoch, self.T = tenants_new, epoch, T
+            self.stats.update(bootstrapped_at=time.time(), bootstrap_s=round(time.time() - t0, 2),
+                              bootstrap_read_s=round(t_read, 2), orders=int(len(o["oid"])),
+                              items=int(len(it["oid"])))
+
+    # ---------- applying CDC transactions ----------
+    def tenant(self, tid):
+        t = self.tenants.get(tid)
+        if t is None:
+            t = self.tenants[tid] = Tenant(tid, self.epoch, self.T)
+        return t
+
+    def apply_txn(self, changes, lsn, xid, commit_us):
+        with self.lock:
+            for ch in changes:
+                try:
+                    self._apply(ch)
+                except Exception as e:  # keep streaming; surface in /health
+                    self.stats["errors"] += 1
+                    self.stats["last_error"] = f"{type(e).__name__}: {e} in {ch}"
+            now = time.time()
+            self.stats.update(applied_lsn=lsn, last_xid=xid, last_apply_wall=now,
+                              txns=self.stats["txns"] + 1, changes=self.stats["changes"] + len(changes))
+            if commit_us is not None:
+                self.stats["last_commit_ts"] = commit_us / 1e6
+                self.stats["lag_ms"] = round(now * 1000 - commit_us / 1000, 1)
+
+    def _apply(self, ch):
+        kind, table, old, new = ch
+        if kind == "MESSAGE":
+            self.stats["last_marker"] = new
+            return
+        if table == "orders":
+            self._apply_order(kind, old, new)
+        elif table == "order_items":
+            self._apply_item(kind, old, new)
+        elif table == "products" and kind in ("INSERT", "UPDATE"):
+            self.tenant(new["tenant_id"]).pidx_of(new["product_id"], new["name"])
+        elif table == "tenants" and kind == "INSERT":
+            self.tenant(new["tenant_id"])
+        elif kind == "TRUNCATE":
+            raise RuntimeError(f"TRUNCATE on {table}: full rebuild required")
+
+    def _apply_order(self, kind, old, new):
+        if kind == "INSERT":
+            t = self.tenant(new["tenant_id"])
+            st = S_IDX[new["status"]]
+            t.ov_add(new["order_id"], [new["created_at"], st, new["total_cents"], {}])
+            t.hour_delta(new["created_at"], st, new["total_cents"], +1)
+            return
+        t = self.tenant(old["tenant_id"])
+        oid = old["order_id"]
+        ov, pos = t.find(oid)
+        if ov is None and pos is None:
+            raise KeyError(f"order {oid} not in mirror")
+        items = list(ov[3].values()) if ov is not None else t.base_items(pos)
+        o_st = S_IDX[old["status"]]
+        t.hour_delta(old["created_at"], o_st, old["total_cents"], -1)
+        if COUNTED[o_st]:
+            t.prod_delta(old["created_at"], items, -1)
+        if kind == "DELETE":
+            if ov is not None:
+                t.ov_remove(oid)
+            else:
+                t.b_status[pos] = DELETED
+            return
+        # UPDATE
+        if new["tenant_id"] != old["tenant_id"]:
+            raise NotImplementedError("tenant_id change")
+        n_st = S_IDX[new["status"]]
+        t.hour_delta(new["created_at"], n_st, new["total_cents"], +1)
+        if COUNTED[n_st]:
+            t.prod_delta(new["created_at"], items, +1)
+        if ov is None and new["created_at"] == int(t.b_created[pos]):
+            t.b_status[pos] = n_st
+            t.b_total[pos] = new["total_cents"]
+            return
+        if ov is None:
+            ov = t.promote(pos)
+        t.ov_remove(oid)
+        ov[0], ov[1], ov[2] = new["created_at"], n_st, new["total_cents"]
+        t.ov_add(oid, ov)
+
+    def _apply_item(self, kind, old, new):
+        if kind in ("DELETE", "UPDATE"):
+            t = self.tenant(old["tenant_id"])
+            o = self._order_for_items(t, old["order_id"])
+            pidx, sales = o[3].pop(old["line_no"])
+            if COUNTED[o[1]]:
+                t.prod_delta(o[0], [(pidx, sales)], -1)
+        if kind in ("INSERT", "UPDATE"):
+            t = self.tenant(new["tenant_id"])
+            o = self._order_for_items(t, new["order_id"])
+            pidx = t.pidx_of(new["product_id"])
+            sales = new["qty"] * new["price_cents"]
+            o[3][new["line_no"]] = (pidx, sales)
+            if COUNTED[o[1]]:
+                t.prod_delta(o[0], [(pidx, sales)], +1)
+
+    @staticmethod
+    def _order_for_items(t, oid):
+        ov, pos = t.find(oid)
+        if ov is not None:
+            return ov
+        if pos is None:
+            raise KeyError(f"order {oid} not in mirror")
+        return t.promote(pos)
+
+    # ---------- queries ----------
+    def get(self, tid):
+        t = self.tenants.get(tid)
+        if t is None:
+            raise KeyError(tid)
+        return t
+
+    def count(self, tid, f, t):
+        with self.lock:
+            return self.get(tid).range_status(f, t)
+
+    def trend(self, tid, f, t, step):
+        with self.lock:
+            return self.get(tid).trend(f, t, step)
+
+    def top(self, tid, f, t, n):
+        with self.lock:
+            ten = self.get(tid)
+            v = ten.range_products(f, t)
+            pos = np.flatnonzero(v > 0)
+            if len(pos) > n:
+                kth = np.partition(v[pos], len(pos) - n)[len(pos) - n]
+                pos = pos[v[pos] >= kth]
+            order = np.lexsort((ten.pid_arr[pos], -v[pos]))[:n]
+            pos = pos[order]
+            return [(int(ten.pid_arr[i]), ten.pid_names[i], int(v[i])) for i in pos]
