@@ -88,8 +88,15 @@ class CDC(threading.Thread):
         with admin.cursor() as c:
             c.execute("ALTER TABLE orders REPLICA IDENTITY FULL")
             c.execute("ALTER TABLE order_items REPLICA IDENTITY FULL")
-            c.execute("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-                      "WHERE slot_name = %s AND NOT active", (self.slot,))
+            for _ in range(100):  # after a rebuild the old walsender may need a moment to exit
+                c.execute("SELECT active FROM pg_replication_slots WHERE slot_name = %s", (self.slot,))
+                row = c.fetchone()
+                if row is None:
+                    break
+                if not row[0]:
+                    c.execute("SELECT pg_drop_replication_slot(%s)", (self.slot,))
+                    break
+                time.sleep(0.1)
         admin.close()
 
         self.repl = psycopg2.connect(self.dsn, connection_factory=psycopg2.extras.LogicalReplicationConnection)
@@ -110,6 +117,11 @@ class CDC(threading.Thread):
         self.rcur.start_replication(slot_name=self.slot, decode=True, start_lsn=consistent_point,
                                     options={"include-xids": "1", "include-timestamp": "1",
                                              "skip-empty-xacts": "1"})
+
+    def stop(self):
+        self.stop_evt.set()
+        self.join(timeout=5)
+        self.repl.close()
 
     def run(self):
         try:

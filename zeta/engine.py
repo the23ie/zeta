@@ -12,9 +12,12 @@ UPDATE -> -old +new. All aggregates are sums, so retractions are exact.
 Time is int64 microseconds since the Unix epoch, buckets are UTC-aligned.
 """
 import bisect
+import hashlib
 import io
+import math
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import pyarrow as pa
@@ -28,6 +31,22 @@ DELETED = NS  # mirror-only marker: base row moved to overflow or deleted
 COUNTED = np.array([True, True, True, False, False, False])
 HOUR = 3_600_000_000
 DAY = 24 * HOUR
+
+# Homomorphic ledger hash: H = sum h(order_id|status|total_cents|epoch_seconds) mod p
+P61 = (1 << 61) - 1
+HASH_SQL = ("('x' || substr(md5(order_id || '|' || status || '|' || total_cents || '|' || "
+            "extract(epoch FROM created_at)::bigint), 1, 15))::bit(60)::bigint")
+
+
+def _rsec(us):
+    """extract(epoch)::bigint rounds half away from zero."""
+    q, r = divmod(abs(us), 1_000_000)
+    q += r >= 500_000
+    return q if us >= 0 else -q
+
+
+def row_hash(oid, status, total, created_us):
+    return int(hashlib.md5(f"{oid}|{status}|{total}|{_rsec(created_us)}".encode()).hexdigest()[:15], 16)
 
 
 class Fenwick:
@@ -72,6 +91,8 @@ class Tenant:
         self.epoch, self.T, self.D = epoch, T, T // 24
         self.hour_raw = np.zeros((T, 2, NS), np.int64)
         self.hour = Fenwick(self.hour_raw)
+        self.hb = np.zeros(T, np.int64)  # ledger hash per hour bucket (mod P61)
+        self.h_out = 0                   # ledger hash of orders outside the bucket axis
         self.pid_arr = np.zeros(0, np.int64)
         self.pid_names = []
         self.pid_index = {}
@@ -157,6 +178,16 @@ class Tenant:
         return [self.ov[oid] for _, oid in self.ov_keys[lo:hi]]
 
     # ---------- Z-set deltas into the aggregates ----------
+    def hour_of(self, created):
+        h = (created - self.epoch) // HOUR
+        return h if 0 <= h < self.T else None
+
+    def hash_delta(self, h, hv):
+        if h is None:
+            self.h_out = (self.h_out + hv) % P61
+        else:
+            self.hb[h] = (int(self.hb[h]) + hv) % P61
+
     def hour_delta(self, created, status, total, sign):
         h = (created - self.epoch) // HOUR
         if not 0 <= h < self.T:
@@ -263,6 +294,71 @@ class Tenant:
             starts, vals = starts[order], vals[order]
         return starts, vals
 
+    # ---------- cost (known before running the query) ----------
+    def _rows(self, a, b):
+        if b <= a:
+            return 0, 0
+        lo = np.searchsorted(self.b_created, a, "left")
+        hi = np.searchsorted(self.b_created, b, "left")
+        return int(hi - lo), int(self.b_ptr[hi] - self.b_ptr[lo])
+
+    def cost(self, kind, f, t, step=HOUR):
+        """Work units (~10 µs each): Fenwick node reads x node width + edge rows + output buckets."""
+        _, f2, t2 = self._split(f, t)
+        top = kind == "top"
+        unit, width, n = (DAY, self.P, self.D) if top else (HOUR, 2 * NS, self.T)
+        c = 1.0
+        if t2 > f2:
+            b0, b1 = _ceil_div(f2 - self.epoch, unit), (t2 - self.epoch) // unit
+            edges = [(f2, self.epoch + b0 * unit), (self.epoch + b1 * unit, t2)] if b0 < b1 else [(f2, t2)]
+            if b0 < b1 and kind != "trend":
+                c += 2 * math.log2(n) * width / 1000
+            for a, b in edges:
+                o, i = self._rows(a, b)
+                c += (i if top else o) / 200
+            if kind == "trend":
+                c += (t2 - f2) / step / 100
+        return round(c, 2)
+
+    # ---------- audit / repair ----------
+    def outside_parts(self):
+        return [(-(2 ** 62), self.epoch), (self.epoch + self.T * HOUR, 2 ** 62)]
+
+    def audit_range(self, h0, h1):
+        """[count, revenue, hash] for hour buckets [h0, h1), read from the Fenwick and bucket hashes."""
+        v = self.hour.range(h0, h1)
+        return [int(v[0].sum()), int(v[1].sum()), int(sum(self.hb[h0:h1].tolist())) % P61]
+
+    def audit_outside(self):
+        v = sum((self.edge_status(a, b) for a, b in self.outside_parts()), np.zeros((2, NS), np.int64))
+        return [int(v[0].sum()), int(v[1].sum()), self.h_out]
+
+    def mirror_rows(self, a, b):
+        """(oid, status, total, created) of live mirror rows with created in [a, b)."""
+        lo = np.searchsorted(self.b_created, a, "left")
+        hi = np.searchsorted(self.b_created, b, "left")
+        live = np.flatnonzero(self.b_status[lo:hi] != DELETED) + lo
+        rows = list(zip(self.b_oid[live].tolist(), self.b_status[live].tolist(),
+                        self.b_total[live].tolist(), self.b_created[live].tolist()))
+        lo_k = bisect.bisect_left(self.ov_keys, (a,))
+        hi_k = bisect.bisect_left(self.ov_keys, (b,))
+        rows += [(oid, self.ov[oid][1], self.ov[oid][2], c) for c, oid in self.ov_keys[lo_k:hi_k]]
+        return rows
+
+    def rebuild_hour(self, h):
+        """Surgical rebuild of one hour bucket (and its day's product vector) from the mirror."""
+        s = self.epoch + h * HOUR
+        new = self.edge_status(s, s + HOUR)
+        delta = new - self.hour_raw[h]
+        self.hour_raw[h] = new
+        self.hour.add(h, delta)
+        self.hb[h] = sum(row_hash(o, STATUSES[st], tot, c) for o, st, tot, c in self.mirror_rows(s, s + HOUR)) % P61
+        d = h // 24
+        ds = self.epoch + d * DAY
+        pdelta = self.edge_products(ds, ds + DAY) - self.day.range(d, d + 1)
+        self.day.add(d, pdelta)
+        return {"hour_fixed": delta.tolist(), "day_products_fixed": int(np.abs(pdelta).sum())}
+
     def _axis_trend(self, f2, t2, step):
         if t2 <= f2:
             return np.zeros(0, np.int64), np.zeros((0, 2, NS), np.int64)
@@ -284,8 +380,11 @@ class Engine:
         self.lock = threading.RLock()
         self.headroom_days, self.lead_days = headroom_days, lead_days
         self.tenants = {}
+        self.tiers = {}
         self.epoch = 0
         self.T = 0
+        self.recent = deque(maxlen=500_000)  # (xid, [(tid, hour|None, d_count, d_revenue, d_hash)])
+        self._txlog = []
         self.stats = dict(bootstrapped_at=None, bootstrap_s=None, applied_lsn=0, last_xid=None,
                           last_commit_ts=None, last_apply_wall=None, lag_ms=None,
                           txns=0, changes=0, last_marker=None, errors=0, last_error=None)
@@ -307,12 +406,12 @@ class Engine:
         """Build all state from the snapshot `cur` is reading in."""
         t0 = time.time()
         status_case = "CASE status " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(STATUSES)) + " END"
-        tenants = self._copy(cur, "SELECT tenant_id FROM tenants", ["tid"])
+        tenants = self._copy(cur, "SELECT tenant_id, tier FROM tenants", ["tid", "tier"], {"tier": pa.string()})
         prods = self._copy(cur, "SELECT product_id, tenant_id, name FROM products ORDER BY tenant_id, product_id",
                            ["pid", "tid", "name"], {"name": pa.string()})
         o = self._copy(cur, f"SELECT order_id, tenant_id, {status_case}, total_cents, "
-                            f"(extract(epoch FROM created_at) * 1000000)::bigint FROM orders",
-                       ["oid", "tid", "st", "tot", "cr"])
+                            f"(extract(epoch FROM created_at) * 1000000)::bigint, {HASH_SQL} FROM orders",
+                       ["oid", "tid", "st", "tot", "cr", "hx"])
         it = self._copy(cur, "SELECT order_id, line_no, product_id, qty::bigint * price_cents FROM order_items",
                         ["oid", "line", "pid", "sales"])
         t_read = time.time() - t0
@@ -370,6 +469,11 @@ class Engine:
             t.hour_raw[:, 0, :] = np.bincount(idx, minlength=T * NS).reshape(T, NS)
             t.hour_raw[:, 1, :] = np.bincount(idx, weights=t.b_total, minlength=T * NS).astype(np.int64).reshape(T, NS)
             t.hour = Fenwick(t.hour_raw)
+            # ledger hash per hour: exact modular sums via 30-bit halves (float64 bincount stays exact)
+            hx = o["hx"][lo_:hi_]
+            hs = np.bincount(h, weights=hx >> 30, minlength=T).astype(np.int64).tolist()
+            ls = np.bincount(h, weights=hx & ((1 << 30) - 1), minlength=T).astype(np.int64).tolist()
+            t.hb = np.array([((a << 30) + b) % P61 for a, b in zip(hs, ls)], np.int64)
             # daily product sales (counted statuses only)
             P = t.P
             counts = np.diff(t.b_ptr)
@@ -382,6 +486,8 @@ class Engine:
 
         with self.lock:
             self.tenants, self.epoch, self.T = tenants_new, epoch, T
+            self.tiers = dict(zip(tenants["tid"].tolist(), tenants["tier"]))
+            self.recent.clear()
             self.stats.update(bootstrapped_at=time.time(), bootstrap_s=round(time.time() - t0, 2),
                               bootstrap_read_s=round(t_read, 2), orders=int(len(o["oid"])),
                               items=int(len(it["oid"])))
@@ -395,12 +501,15 @@ class Engine:
 
     def apply_txn(self, changes, lsn, xid, commit_us):
         with self.lock:
+            self._txlog = []
             for ch in changes:
                 try:
                     self._apply(ch)
                 except Exception as e:  # keep streaming; surface in /health
                     self.stats["errors"] += 1
                     self.stats["last_error"] = f"{type(e).__name__}: {e} in {ch}"
+            if self._txlog:
+                self.recent.append((xid, self._txlog))
             now = time.time()
             self.stats.update(applied_lsn=lsn, last_xid=xid, last_apply_wall=now,
                               txns=self.stats["txns"] + 1, changes=self.stats["changes"] + len(changes))
@@ -419,17 +528,28 @@ class Engine:
             self._apply_item(kind, old, new)
         elif table == "products" and kind in ("INSERT", "UPDATE"):
             self.tenant(new["tenant_id"]).pidx_of(new["product_id"], new["name"])
-        elif table == "tenants" and kind == "INSERT":
+        elif table == "tenants" and kind in ("INSERT", "UPDATE"):
             self.tenant(new["tenant_id"])
+            self.tiers[new["tenant_id"]] = new["tier"]
         elif kind == "TRUNCATE":
             raise RuntimeError(f"TRUNCATE on {table}: full rebuild required")
+
+    def _od(self, t, row, sign):
+        """Order-level Z-set delta: hourly aggregates + ledger hash, logged with the txn for audits."""
+        st, created, total = S_IDX[row["status"]], row["created_at"], row["total_cents"]
+        t.hour_delta(created, st, total, sign)
+        h = t.hour_of(created)
+        hv = row_hash(row["order_id"], row["status"], total, created)
+        hv = hv if sign > 0 else P61 - hv
+        t.hash_delta(h, hv)
+        self._txlog.append((t.tid, h, sign, sign * total, hv))
 
     def _apply_order(self, kind, old, new):
         if kind == "INSERT":
             t = self.tenant(new["tenant_id"])
             st = S_IDX[new["status"]]
             t.ov_add(new["order_id"], [new["created_at"], st, new["total_cents"], {}])
-            t.hour_delta(new["created_at"], st, new["total_cents"], +1)
+            self._od(t, new, +1)
             return
         t = self.tenant(old["tenant_id"])
         oid = old["order_id"]
@@ -438,7 +558,7 @@ class Engine:
             raise KeyError(f"order {oid} not in mirror")
         items = list(ov[3].values()) if ov is not None else t.base_items(pos)
         o_st = S_IDX[old["status"]]
-        t.hour_delta(old["created_at"], o_st, old["total_cents"], -1)
+        self._od(t, old, -1)
         if COUNTED[o_st]:
             t.prod_delta(old["created_at"], items, -1)
         if kind == "DELETE":
@@ -451,7 +571,7 @@ class Engine:
         if new["tenant_id"] != old["tenant_id"]:
             raise NotImplementedError("tenant_id change")
         n_st = S_IDX[new["status"]]
-        t.hour_delta(new["created_at"], n_st, new["total_cents"], +1)
+        self._od(t, new, +1)
         if COUNTED[n_st]:
             t.prod_delta(new["created_at"], items, +1)
         if ov is None and new["created_at"] == int(t.b_created[pos]):
@@ -503,6 +623,18 @@ class Engine:
     def trend(self, tid, f, t, step):
         with self.lock:
             return self.get(tid).trend(f, t, step)
+
+    def corrupt(self, tid, rng):
+        """Demo only: silently damage one hour bucket, like a lost or double-applied delta."""
+        with self.lock:
+            t = self.get(tid)
+            hours = np.flatnonzero(t.hour_raw[:, 0, :].sum(1))
+            h = int(rng.choice(hours))
+            v = np.zeros((2, NS), np.int64)
+            v[0, 3], v[1, 3] = 1, 4999  # one phantom cancelled order
+            t.hour_raw[h] += v
+            t.hour.add(h, v)
+            return h, self.epoch + h * HOUR
 
     def top(self, tid, f, t, n):
         with self.lock:

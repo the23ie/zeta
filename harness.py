@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import psycopg2
 
+from zeta.guard import tenant_key
+
 UTC = timezone.utc
 
 
@@ -65,6 +67,7 @@ def rand_range(rng, lo, hi):
 
 def check(rng, tenants, lo, hi, api, cur):
     tid = rng.choice(tenants)
+    hdr = {"X-API-Key": tenant_key(tid)}  # FR-5: each query uses a key bound to its tenant
     rkind, a, b = rand_range(rng, lo, hi)
     q = rng.choice(["count", "count_status", "by_status", "trend_hour", "trend_day", "top"])
     p = {"from": a.isoformat(), "to": b.isoformat()}
@@ -81,14 +84,14 @@ def check(rng, tenants, lo, hi, api, cur):
         path = f"/tenants/{tid}/orders/count"
         ts = time.perf_counter(); cur.execute(sql, args); exp = tuple(int(x) for x in cur.fetchone())
         sql_ms = (time.perf_counter() - ts) * 1000
-        ta = time.perf_counter(); r = api.get(path, params=p).json(); api_ms = (time.perf_counter() - ta) * 1000
+        ta = time.perf_counter(); r = api.get(path, params=p, headers=hdr).json(); api_ms = (time.perf_counter() - ta) * 1000
         got = (r["count"], r["revenue_cents"])
     elif q == "by_status":
         sql = f"SELECT status, count(*), sum(total_cents) FROM orders WHERE {w} GROUP BY 1"
         ts = time.perf_counter(); cur.execute(sql, args)
         exp = {s: (int(c), int(r_)) for s, c, r_ in cur.fetchall()}
         sql_ms = (time.perf_counter() - ts) * 1000
-        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/orders/by-status", params=p).json()
+        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/orders/by-status", params=p, headers=hdr).json()
         api_ms = (time.perf_counter() - ta) * 1000
         got = {s: (v["count"], v["revenue_cents"]) for s, v in r["by_status"].items() if v["count"]}
     elif q.startswith("trend"):
@@ -99,7 +102,7 @@ def check(rng, tenants, lo, hi, api, cur):
         ts = time.perf_counter(); cur.execute(sql, args)
         exp = [(d.astimezone(UTC).isoformat(), int(c), int(r_)) for d, c, r_ in cur.fetchall()]
         sql_ms = (time.perf_counter() - ts) * 1000
-        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/orders/trend", params=p).json()
+        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/orders/trend", params=p, headers=hdr).json()
         api_ms = (time.perf_counter() - ta) * 1000
         got = [(x["bucket"], x["count"], x["revenue_cents"]) for x in r["buckets"] if x["count"]]
     else:
@@ -113,7 +116,7 @@ def check(rng, tenants, lo, hi, api, cur):
         ts = time.perf_counter(); cur.execute(sql, args + (n,))
         exp = [(int(pid), int(s)) for pid, s in cur.fetchall()]
         sql_ms = (time.perf_counter() - ts) * 1000
-        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/products/top", params=p).json()
+        ta = time.perf_counter(); r = api.get(f"/tenants/{tid}/products/top", params=p, headers=hdr).json()
         api_ms = (time.perf_counter() - ta) * 1000
         got = [(x["product_id"], x["sales_cents"]) for x in r["products"]]
     nonempty = bool(exp[0]) if isinstance(exp, tuple) else bool(exp)
