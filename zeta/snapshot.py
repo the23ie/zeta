@@ -38,9 +38,12 @@ def _write_file(path, write):
 
 
 def save(engine, stream, root):
-    """Checkpoint one store database. Returns the LSN saved, or None if nothing changed since the last one."""
-    if stream.applied_lsn == stream.durable_lsn and stream.snapshot_at is not None:
-        return None
+    """Checkpoint one store database. Returns ("saved", lsn) after writing, or ("same", lsn) when no data changed
+    since the last snapshot: then only markers/heartbeats arrived, the saved state still equals the current
+    state, and the position can be confirmed without writing anything."""
+    with engine.lock:  # read both positions together
+        if stream.snapshot_at is not None and stream.data_lsn == stream.snap_data_lsn:
+            return "same", stream.applied_lsn
     t0 = time.time()
     snap = engine.capture(stream)  # consistent copy under the engine lock, no I/O inside it
     copy_s = time.time() - t0
@@ -71,9 +74,10 @@ def save(engine, stream, root):
         if name not in ("CURRENT", os.path.basename(final)):
             shutil.rmtree(os.path.join(base, name), ignore_errors=True)
     stream.snapshot_at = time.time()
+    stream.snap_data_lsn = snap["data_lsn"]
     stream.snapshot_s = round(time.time() - t0, 2)
     log.debug("%s: snapshot at %X (copy %.2fs, total %.2fs)", stream.db, snap["lsn"], copy_s, stream.snapshot_s)
-    return snap["lsn"]
+    return "saved", snap["lsn"]
 
 
 def load(root, db):

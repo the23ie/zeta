@@ -5,5 +5,5 @@
 #   ./keys.sh --rotate 7    new key for store 7; its old key stops working immediately (also on a running server)
 # A store owner opens  http://<host>:8001/store?key=<their key>
 cd "$(dirname "$0")"
-if [ -f .zeta_secret ]; then export ZETA_SECRET=$(cat .zeta_secret); fi
+source ./env.sh
 exec .venv/bin/python -m zeta.guard "$@"

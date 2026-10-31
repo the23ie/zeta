@@ -7,6 +7,7 @@ existing orders, backdated created_at.
   python simulate.py --dbs 't10m_*' --rate 20 --seconds 600  # steady 20 tx/s for 10 minutes
 """
 import argparse
+import os
 import random
 import time
 from datetime import timedelta
@@ -17,7 +18,7 @@ from zeta.cdc import discover
 
 NEXT = {"placed": ["shipped", "cancelled"], "shipped": ["delivered", "cancelled"],
         "delivered": ["returned"], "cancelled": ["placed"], "returned": ["delivered"]}
-PG = "host=localhost port=5433 user=zeta"
+PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 
 
 class Shop:

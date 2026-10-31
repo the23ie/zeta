@@ -572,7 +572,8 @@ class Engine:
         """Copy everything needed to restore this store database's stores, consistent with
         stream.applied_lsn. Holds the engine lock only while copying (no I/O)."""
         with self.lock:
-            out = {"lsn": stream.applied_lsn, "categories": list(self.categories), "stores": {}}
+            out = {"lsn": stream.applied_lsn, "data_lsn": stream.data_lsn, "categories": list(self.categories),
+                   "stores": {}}
             for tid in stream.tids:
                 t = self.tenants[tid]
                 arrays = {k: getattr(t, k).copy() for k in self.ARRAYS}
@@ -654,7 +655,9 @@ class Engine:
                 self.stats["last_commit_ts"] = commit_us / 1e6
                 self.stats["lag_ms"] = round(now * 1000 - commit_us / 1000, 1)
             if stream is not None:
-                stream.applied_lsn, stream.last_apply_wall, stream.txns = lsn, now, stream.txns + 1
+                stream.applied_lsn, stream.txns = lsn, stream.txns + 1
+                if any(ch[0] != "MESSAGE" for ch in changes):  # real data, not just an audit/harness marker
+                    stream.data_lsn, stream.last_apply_wall = lsn, now
                 if commit_us is not None:
                     stream.last_commit_ts, stream.lag_ms = commit_us / 1e6, self.stats["lag_ms"]
                 for ch in changes:

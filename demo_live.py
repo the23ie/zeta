@@ -13,6 +13,7 @@ Every store has its own Postgres database. For every step it shows
   python demo_live.py --api http://localhost:8000
 """
 import argparse
+import os
 import random
 import time
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ import psycopg2
 from zeta.guard import owner_key, tenant_key
 
 UTC = timezone.utc
+PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 
 
 def rupees(cents):
@@ -38,8 +40,8 @@ class Demo:
         self.stores = {s["tenant_id"]: s["database"] for s in
                        self.api.get("/owner/stores", headers={"X-API-Key": owner_key()}).json()}
         self.dbname = self.stores[self.tid]
-        self.db = psycopg2.connect(f"host=localhost port=5433 user=zeta dbname={self.dbname}")
-        self.all_dbs = [psycopg2.connect(f"host=localhost port=5433 user=zeta dbname={d}")
+        self.db = psycopg2.connect(f"{PG} dbname={self.dbname}")
+        self.all_dbs = [psycopg2.connect(f"{PG} dbname={d}")
                         for d in sorted(set(self.stores.values()))]
         self.hdr = {"X-API-Key": tenant_key(self.tid)}
         now = datetime.now(UTC)

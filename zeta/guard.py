@@ -30,6 +30,7 @@ SECRET = (os.environ.get("ZETA_SECRET")
 AUTH = os.environ.get("ZETA_AUTH", "1") == "1"
 LIMITS = os.environ.get("ZETA_LIMITS", "1") == "1"
 TIER_CAPACITY = {"enterprise": 20000, "growth": 8000, "starter": 4000, "owner": 200000}  # cost units; refill = capacity / 2 per s
+TIER_CONCURRENCY = {"enterprise": 8, "growth": 4, "starter": 2, "owner": 16}  # queries one store may run at the same time
 
 
 def _mac(msg, n):
@@ -102,6 +103,23 @@ class Limiter:
         self.lock = threading.Lock()
         self.buckets = {}  # tid -> [tokens, last_refill, capacity]
         self.rejected = {}
+        self.inflight = {}  # tid -> queries running now
+
+    def enter(self, tid, tier):
+        """Start a query for this store unless it already runs its tier's maximum at once (B-3: a store firing many
+        heavy queries in parallel gets 429 instead of taking every worker thread). Pair with leave()."""
+        cap = TIER_CONCURRENCY.get(tier, TIER_CONCURRENCY["starter"])
+        with self.lock:
+            n = self.inflight.get(tid, 0)
+            if n >= cap:
+                self.rejected[tid] = self.rejected.get(tid, 0) + 1
+                return False
+            self.inflight[tid] = n + 1
+            return True
+
+    def leave(self, tid):
+        with self.lock:
+            self.inflight[tid] = max(0, self.inflight.get(tid, 0) - 1)
 
     def charge(self, tid, tier, cost):
         """Returns (allowed, tokens_left, retry_after_s)."""
@@ -124,8 +142,8 @@ class Limiter:
 
     def snapshot(self):
         with self.lock:
-            return {tid: {"tokens": round(b[0]), "capacity": b[2], "rejected": self.rejected.get(tid, 0)}
-                    for tid, b in self.buckets.items()}
+            return {tid: {"tokens": round(b[0]), "capacity": b[2], "rejected": self.rejected.get(tid, 0),
+                          "in_flight": self.inflight.get(tid, 0)} for tid, b in self.buckets.items()}
 
 
 def _stores_in(prefix):

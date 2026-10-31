@@ -3,6 +3,7 @@
 #   ./run_store.sh t10m       (shops in t10m_001..t10m_100)
 set -euo pipefail
 cd "$(dirname "$0")"
+source ./env.sh
 SET=${1:-t10m}
 PORT=${2:-9000}
 case "$SET" in *\**|*,*) DBS=$SET ;; *) DBS="${SET}_*" ;; esac

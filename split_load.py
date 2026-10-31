@@ -10,6 +10,7 @@ databases by prefix and follows one change stream per database.
 """
 import argparse
 import io
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,7 +21,7 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 
 TABLES = ["tenants", "customers", "products", "orders", "order_items"]
-BASE = "host=localhost port=5433 user=zeta dbname={}"
+BASE = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta") + " dbname={}"
 
 
 def read(path):

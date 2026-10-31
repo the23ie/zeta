@@ -59,15 +59,18 @@ log = logging.getLogger("zeta")
 
 PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 DBS = os.environ.get("ZETA_DBS", "t1m_*")  # one database per store: a prefix pattern or a comma list
+SHARD = os.environ.get("ZETA_SHARD")  # "k/N": this node follows every N-th store database starting at k (scale-out)
 AUDIT_INTERVAL = float(os.environ.get("ZETA_AUDIT_INTERVAL", "60"))
 # checkpoints: restart = load snapshot + replay WAL since it, instead of re-reading every store database
 SNAP_DIR = None if os.environ.get("ZETA_SNAPSHOTS", "1") == "0" else os.environ.get(
     "ZETA_SNAPSHOT_DIR", str(Path(__file__).resolve().parent.parent / "snapshots"))
 SNAP_INTERVAL = float(os.environ.get("ZETA_SNAPSHOT_INTERVAL", "60"))
+DISCOVER_INTERVAL = float(os.environ.get("ZETA_DISCOVER_INTERVAL", "15"))  # s between looks for new store databases; 0 = off
+HEARTBEAT = float(os.environ.get("ZETA_HEARTBEAT", "5"))  # s between per-database heartbeats (live CDC lag); 0 = off
 MIN_US, MAX_US = -(2 ** 62), 2 ** 62
 
 engine = Engine()
-hub = Hub(engine, PG, DBS, snap_root=SNAP_DIR, snap_interval=SNAP_INTERVAL)
+hub = Hub(engine, PG, DBS, snap_root=SNAP_DIR, snap_interval=SNAP_INTERVAL, heartbeat=HEARTBEAT, shard=SHARD)
 auditor = Auditor(engine, hub, AUDIT_INTERVAL)
 limiter = guard.Limiter()
 LAT = defaultdict(lambda: deque(maxlen=5000))
@@ -80,6 +83,8 @@ async def lifespan(app):
     hub.bootstrap()
     hub.start()
     hub.start_snapshots()
+    hub.start_heartbeats()
+    hub.start_discovery(DISCOVER_INTERVAL)
     auditor.start()
     orders = sum(st.boot.get("orders", 0) for st in hub.streams.values())
     resumed = sum(st.resumed for st in hub.streams.values())
@@ -99,7 +104,12 @@ app = FastAPI(title="ZETA", lifespan=lifespan)
 @app.middleware("http")
 async def timing(request: Request, call_next):
     t0 = time.perf_counter()
-    resp = await call_next(request)
+    try:
+        resp = await call_next(request)
+    finally:
+        slot = getattr(request.state, "zeta_slot", None)
+        if slot is not None:  # the query admitted by _charge has finished
+            limiter.leave(slot)
     route = request.scope.get("route")
     if route is not None and route.path.startswith(("/tenants", "/owner", "/analytics")):
         LAT[route.path].append(((time.perf_counter() - t0) * 1000, resp.status_code))
@@ -130,7 +140,8 @@ def _fresh(st):
     return {"database": st.db, "as_of_lsn": lsn_str(st.applied_lsn),
             "last_commit_at": iso(int(st.last_commit_ts * 1e6)) if st.last_commit_ts else None,
             "cdc_lag_ms": st.lag_ms,
-            "updated_s_ago": round(now - st.last_apply_wall, 2) if st.last_apply_wall else None}
+            "updated_s_ago": round(now - st.last_apply_wall, 2) if st.last_apply_wall else None,
+            "heartbeat_s_ago": round(now - st.heartbeat_at, 2) if st.heartbeat_at else None}
 
 
 def freshness(tid):
@@ -173,15 +184,21 @@ def admit(request, response, tid, kind, fu, tu, step=HOUR):
     response.headers["X-ZETA-Cost"] = str(cost)
     if guard.LIMITS and who != "admin":
         bucket, tier = ("owner", "owner") if who == "owner" else (tid, engine.tiers.get(tid))
-        _charge(response, bucket, tier, cost)
+        _charge(request, response, bucket, tier, cost)
 
 
-def _charge(response, bucket, tier, cost):
+def _charge(request, response, bucket, tier, cost):
+    """B-3: at most a few queries at once per store (by tier), and a cost budget that refills over time."""
+    if not limiter.enter(bucket, tier):
+        raise HTTPException(429, f"{bucket} is already running its maximum number of queries at once; retry shortly",
+                            headers={"Retry-After": "0.2", "X-ZETA-Cost": str(cost)})
     ok, left, retry = limiter.charge(bucket, tier, cost)
     response.headers["X-RateLimit-Remaining"] = str(int(left))
     if not ok:
+        limiter.leave(bucket)
         raise HTTPException(429, f"{bucket} over its limit (query cost {cost})",
                             headers={"Retry-After": str(retry), "X-ZETA-Cost": str(cost)})
+    request.state.zeta_slot = bucket  # released by the middleware when the query has finished
 
 
 def admit_owner(request, response, kind, fu, tu, stores, step=HOUR):
@@ -197,7 +214,7 @@ def admit_owner(request, response, kind, fu, tu, stores, step=HOUR):
         cost = engine.tenants[who].cost(kind, fu, tu, step)
         response.headers["X-ZETA-Cost"] = str(cost)
         if guard.LIMITS:
-            _charge(response, who, engine.tiers.get(who), cost)
+            _charge(request, response, who, engine.tiers.get(who), cost)
         return [who]
     if stores:
         try:
@@ -212,7 +229,7 @@ def admit_owner(request, response, kind, fu, tu, stores, step=HOUR):
     cost = round(sum(engine.tenants[t].cost(kind, fu, tu, step) for t in tids), 2)
     response.headers["X-ZETA-Cost"] = str(cost)
     if guard.LIMITS and who == "owner":
-        _charge(response, "owner", "owner", cost)
+        _charge(request, response, "owner", "owner", cost)
     return tids
 
 
@@ -386,44 +403,19 @@ def owner_top(request: Request, response: Response, from_: Optional[str] = Query
 # Every number below is built from the same exact, invertible aggregates (counts and sums by store,
 # status, hour, product, category). Ratios (AOV, rates, growth) are derived from exact sums.
 
-METRICS = {
-    "orders": "orders created in the range (all statuses)",
-    "revenue": "sum of order totals, all statuses",
-    "net_sales": "order totals excluding cancelled and returned orders",
-    "aov": "average order value = revenue / orders",
-    "cancel_rate": "cancelled orders / orders",
-    "return_rate": "returned orders / orders",
-    "sales": "item sales (qty x price) excluding cancelled and returned orders; the only metric for category / product",
-}
-GROUPS = ["none", "store", "status", "category", "product", "day", "hour_of_day", "weekday"]
-WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-I_CANC, I_RET = S_IDX["cancelled"], S_IDX["returned"]
+from .defs import GROUPS, I_CANC, I_RET, METRICS, WEEKDAYS, cancel_flag, change as _change, kpis, metric_value
 
 
 def _metric(v, metric):
-    """v: [count|revenue, status] -> value of an order-level metric."""
-    n, rev = int(v[0].sum()), int(v[1].sum())
-    if metric == "orders":
-        return n
-    if metric == "revenue":
-        return rev
-    if metric == "net_sales":
-        return rev - int(v[1, I_CANC]) - int(v[1, I_RET])
-    if metric == "aov":
-        return round(rev / n) if n else 0
-    if metric == "cancel_rate":
-        return round(int(v[0, I_CANC]) / n, 4) if n else 0.0
-    if metric == "return_rate":
-        return round(int(v[0, I_RET]) / n, 4) if n else 0.0
-    raise HTTPException(400, f"metric must be one of {list(METRICS)}")
+    """v: [count|revenue, status] -> value of an order-level metric (shared definition, zeta/defs.py)."""
+    try:
+        return metric_value(v[0].tolist(), v[1].tolist(), metric)
+    except KeyError:
+        raise HTTPException(400, f"metric must be one of {list(METRICS)}")
 
 
 def _kpis(v):
-    return {m: _metric(v, m) for m in ("orders", "revenue", "net_sales", "aov", "cancel_rate", "return_rate")}
-
-
-def _change(cur, prev):
-    return {k: (round((cur[k] - prev[k]) / prev[k] * 100, 1) if prev[k] else None) for k in cur}
+    return kpis(v[0].tolist(), v[1].tolist())
 
 
 def _require_range(fu, tu):
@@ -447,6 +439,8 @@ def analytics_summary(request: Request, response: Response, from_: Optional[str]
                           previous_period={"from": iso(2 * fu - tu), "to": iso(fu)},
                           by_status={s: {"count": int(cur[0, i]), "revenue_cents": int(cur[1, i])}
                                      for i, s in enumerate(STATUSES)},
+                          previous_by_status={s: {"count": int(prev[0, i]), "revenue_cents": int(prev[1, i])}
+                                              for i, s in enumerate(STATUSES)},
                           categories=engine.owner_categories(tids, fu, tu))
 
 
@@ -470,11 +464,12 @@ def analytics_stores(request: Request, response: Response, from_: Optional[str] 
         growth = _change(k, kp)["orders"]
         if growth is not None and growth <= -20 and kp["orders"] >= 20:
             flags.append(f"orders down {abs(growth):.0f}% vs previous period")
-        if k["orders"] >= 20 and all_k["cancel_rate"] and k["cancel_rate"] >= 1.5 * all_k["cancel_rate"]:
-            flags.append(f"cancel rate {k['cancel_rate'] * 100:.1f}% vs {all_k['cancel_rate'] * 100:.1f}% overall")
+        if cancel_flag(k, all_k):
+            flags.append(cancel_flag(k, all_k))
         rows.append({"tenant_id": tid, "name": engine.names.get(tid), "tier": engine.tiers.get(tid),
                      "database": engine.stream_of[tid].db if tid in engine.stream_of else None,
-                     **k, "previous_orders": kp["orders"], "previous_revenue": kp["revenue"],
+                     **k, "cancelled_orders": int(cur[tid][0, I_CANC]), "returned_orders": int(cur[tid][0, I_RET]),
+                     "previous_orders": kp["orders"], "previous_revenue": kp["revenue"],
                      "growth_pct": growth, "revenue_growth_pct": _change(k, kp)["revenue"],
                      "spark": [int(v[0].sum()) for v in vals], "spark_start": iso(day0), "flags": flags})
     rows.sort(key=lambda r: (-r["revenue"], r["tenant_id"]))
@@ -658,6 +653,14 @@ def snapshot_now(request: Request):
     """Save every store database that changed since its last snapshot (also runs every ZETA_SNAPSHOT_INTERVAL s)."""
     require_admin(request)
     return hub.snapshot_all()
+
+
+@app.post("/admin/discover")
+def discover_now(request: Request):
+    """Start following store databases created since startup right away (otherwise found within ~2 discovery passes)."""
+    require_admin(request)
+    added = hub.discover_new(now=True)
+    return {"added": added, "databases": len(hub.streams)}
 
 
 @app.post("/admin/rebuild")

@@ -54,27 +54,22 @@ owns all stores. It can also prove that its totals match the databases. [V] (`ze
 | `.venv/` (not in git) | Python virtual environment, 212 MB | [V] |
 | `.zeta_secret` (not in git) | Secret that signs all API keys | [V] |
 
-There is **no `requirements.txt`, no setup script, no Dockerfile and no unit-test suite** in the repository.
-The only automated pass/fail tests are `harness.py` (correctness) and `test_isolation.py` (isolation). [V]
+`requirements.txt` (version ranges), `requirements.lock` (exact tested versions) and `setup.sh` (one command) exist;
+there is no Dockerfile and no unit-test suite. The automated pass/fail tests are `harness.py` (correctness) and
+`test_isolation.py` (isolation). [V]
 
 ### How to start it from scratch
 
-**Not implemented as one command.** The steps below are what was done by hand on this laptop. They have
-**not** been tested on a fresh machine. [R for the steps, A that they work elsewhere]
-
 ```bash
-brew install postgresql@15                           # Postgres 15 binaries
-python3 -m venv .venv && .venv/bin/pip install numpy pyarrow psycopg2-binary fastapi "uvicorn[standard]" httpx
-LC_ALL=en_US.UTF-8 /opt/homebrew/opt/postgresql@15/bin/initdb -D pgdata -U zeta --auth=trust -E UTF8
-# append the settings shown in §2 (port 5433, wal_level=logical, slot limits ...) to pgdata/postgresql.conf
-LC_ALL=en_US.UTF-8 /opt/homebrew/opt/postgresql@15/bin/pg_ctl -D pgdata -l pgdata/server.log start
-.venv/bin/python generate_data.py --orders 1000000 --tenants 10 --end 2026-10-31T09:00:00 --out data_1m
-.venv/bin/python generate_data.py --end 2026-10-31T09:00:00 --out data_10m
-.venv/bin/python split_load.py data_1m --prefix t1m && .venv/bin/python split_load.py data_10m --prefix t10m
-openssl rand -hex 16 > .zeta_secret
-./run.sh t1m 8000 &  ./run.sh t10m 8001 &
+brew install python postgresql@15      # Python 3.11+, PostgreSQL 15+
+./setup.sh                             # venv, Postgres cluster with ZETA's settings (§2), .zeta_secret, 1M + 10M datasets
+./run.sh t1m 8000 &  ./run.sh t10m 8001 &      # or: ./run_cluster.sh t10m 2 8001  (2 nodes + router)
 ./keys.sh 1          # prints store 1's key, the owner key and the admin key
 ```
+
+`setup.sh --small` was run on a clean copy of the repository (no venv, data or secret; Postgres on port 5544): it
+finished in 24 s, and a 2-node cluster on that copy passed 600/600 correctness and 239/239 isolation checks. [V]
+It has not been tried on Linux or on a machine without Homebrew. [A]
 
 A judge then opens `http://localhost:8001/dashboard?key=<owner key>` and sees the Overview tab (headline
 numbers for all 100 stores with change vs the previous period, a trend chart, category mix, status
@@ -233,6 +228,16 @@ thread pool; one **Hub** thread reads all replication streams (`zeta/cdc.py:187-
   (`max_slot_wal_keep_size`), beyond which ZETA falls back to a full load. [V]
 
 ---
+
+### Scale-out (several nodes + router) [V] `zeta/router.py`, `run_cluster.sh`
+
+`ZETA_SHARD=k/N` makes a node follow only the store databases whose number mod N is k (`cdc.shard_of`). The router
+(no data of its own) forwards store routes to the owning node and fans owner/analytics/operations routes out to all
+nodes (or only those holding `stores=`), merging exactly: sums, bucket-wise trend merge, top-N re-rank (the global top
+N is inside the union of each node's top N), ratios recomputed from summed parts via the shared `zeta/defs.py`.
+Keys are checked by the nodes (same secret). Verified on 2 nodes / 10M: 720/720 harness checks, 239 isolation checks,
+22/22 merge cross-checks against the per-node answers. Not done: a node failure is reported (503), not failed over;
+nodes run on one machine here.
 
 ## 5. The query engine
 
@@ -744,7 +749,8 @@ demonstrated**: it passed once and failed once.
 
 - One replication slot, walsender process and connection per store database; 1,000 stores would need 1,000.
   Every walsender also reads the whole cluster's WAL. [A for the performance impact]
-- A new store database is only discovered at restart (`discover` runs in `Hub.bootstrap`).
+- New store databases are discovered while running (every 15 s, `Hub.discover_new`; `POST /admin/discover`). [V]
+  A deleted store database is not handled: its stream reports an error until ZETA restarts.
 - A new store added *inside* an existing database detaches the owner index until a rebuild (`engine.py:618-623`).
 
 **After a restart** [V]

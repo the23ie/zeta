@@ -13,6 +13,7 @@ Before checking, the same transactional marker is written into every store datab
 until ZETA has applied it on every stream, so both sides answer from the same committed state.
 """
 import argparse
+import os
 import random
 import subprocess
 import sys
@@ -28,7 +29,7 @@ from zeta.cdc import discover
 from zeta.guard import admin_key, owner_key, tenant_key
 
 UTC = timezone.utc
-PG = "host=localhost port=5433 user=zeta"
+PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 STATUSES = ["placed", "shipped", "delivered", "cancelled", "returned"]
 TOP_SQL = ("SELECT i.product_id, sum(i.qty::bigint * i.price_cents) s FROM order_items i "
            "JOIN orders o ON o.order_id = i.order_id "

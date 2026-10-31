@@ -17,6 +17,7 @@ import re
 import select
 import threading
 import time
+import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -113,6 +114,10 @@ class Stream:
         self.snapshot_at = self.snapshot_s = None
         self.resumed = False
         self.skipped_txns = 0
+        self.data_lsn = 0        # newest applied transaction that changed data (markers and heartbeats don't)
+        self.snap_data_lsn = -1  # data_lsn captured in the last snapshot
+        self.hb_conn = None
+        self.heartbeat_at = None
 
     @property
     def confirm_lsn(self):
@@ -155,6 +160,7 @@ class Stream:
                 t0 = time.time()
                 self.boot = self.engine.restore(snap, self)
                 self.applied_lsn = self.durable_lsn = self.skip_until = snap["lsn"]
+                self.data_lsn = self.snap_data_lsn = snap["lsn"]
                 self.snapshot_at = snap["saved_at"]
                 self.repl = psycopg2.connect(self.dsn, connection_factory=psycopg2.extras.LogicalReplicationConnection)
                 self.rcur = self.repl.cursor()
@@ -195,7 +201,8 @@ class Stream:
         snap.rollback()
         snap.close()
         # the source database holds everything up to the consistent point, so it is safe to confirm
-        self.applied_lsn = self.durable_lsn = lsn_int(consistent_point)
+        self.applied_lsn = self.durable_lsn = self.data_lsn = lsn_int(consistent_point)
+        self.snap_data_lsn = -1
         self.skip_until, self.resumed, self.snapshot_at = 0, False, None
         self.rcur.start_replication(slot_name=self.slot, decode=True, start_lsn=consistent_point,
                                     options={"include-xids": "1", "include-timestamp": "1",
@@ -204,10 +211,27 @@ class Stream:
                  self.boot.get("orders"), self.tids)
 
     def close(self):
+        for c in (self.repl, self.hb_conn):
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def heartbeat(self):
+        """Write a timestamped marker into this database's WAL; its trip back through the stream is the CDC lag,
+        measured even when no orders arrive. Non-transactional: no transaction id, decoded as soon as written."""
         try:
-            self.repl.close()
+            if self.hb_conn is None or self.hb_conn.closed:
+                self.hb_conn = psycopg2.connect(self.dsn)
+                self.hb_conn.autocommit = True
+            with self.hb_conn.cursor() as c:
+                c.execute("SELECT pg_logical_emit_message(false, 'zeta', %s)", (f"hb:{time.time_ns() // 1000}",))
         except Exception:
-            pass
+            try:
+                self.hb_conn.close()
+            except Exception:
+                pass
+            self.hb_conn = None
 
     def drain(self):
         """Apply every message waiting on this stream. Returns True if anything arrived."""
@@ -234,7 +258,12 @@ class Stream:
                 self.changes.append(parse_change(p))
             elif p.startswith("message:"):
                 m = MESSAGE.match(p)
-                if m and m.group(2) == "zeta":
+                if m and m.group(2) == "zeta" and m.group(3).startswith("hb:"):
+                    self.lag_ms = round(time.time() * 1000 - int(m.group(3)[3:]) / 1000, 1)
+                    self.heartbeat_at = time.time()
+                    if not self.in_txn:  # every transaction committed before it has been applied already
+                        self.applied_lsn = max(self.applied_lsn, msg.data_start)
+                elif m and m.group(2) == "zeta":
                     # skip-empty-xacts: a txn holding only a message has no BEGIN/COMMIT around it
                     if self.in_txn:
                         self.changes.append(("MESSAGE", None, None, m.group(3)))
@@ -246,6 +275,7 @@ class Stream:
                 "saved_lsn": lsn_str(self.durable_lsn), "resumed_from_snapshot": self.resumed,
                 "snapshot_age_s": round(time.time() - self.snapshot_at, 1) if self.snapshot_at else None,
                 "snapshot_s": self.snapshot_s, "skipped_txns": self.skipped_txns,
+                "heartbeat_age_s": round(time.time() - self.heartbeat_at, 1) if self.heartbeat_at else None,
                 "lag_ms": self.lag_ms, "txns": self.txns, "last_marker": self.last_marker,
                 "orders_at_bootstrap": self.boot.get("orders"), "bootstrap_s": self.boot.get("bootstrap_s")}
 
@@ -263,12 +293,22 @@ def discover(base_dsn, spec):
     return dbs
 
 
+def shard_of(db, n):
+    """Which of n ZETA nodes follows a store database. By the number at the end of its name (t10m_007 -> 6 % n), so
+    consecutive stores - and the few big ones - spread over the nodes, and a new database never moves an old one."""
+    m = re.search(r"(\d+)$", db)
+    return ((int(m.group(1)) - 1) if m else zlib.crc32(db.encode())) % n
+
+
 class Hub(threading.Thread):
     """Follows every store database's change stream from one thread (select over all slots)."""
 
-    def __init__(self, engine, base_dsn, spec, workers=6, snap_root=None, snap_interval=60.0):
+    def __init__(self, engine, base_dsn, spec, workers=6, snap_root=None, snap_interval=60.0, heartbeat=5.0,
+                 shard=None):
         super().__init__(daemon=True, name="zeta-cdc")
+        self.shard = tuple(int(x) for x in shard.split("/")) if shard else None  # (k, N)
         self.engine, self.base_dsn, self.spec, self.workers = engine, base_dsn, spec, workers
+        self.heartbeat_interval = heartbeat
         self.snap_root, self.snap_interval = snap_root, snap_interval
         self.snap_lock = threading.Lock()
         self.rebuild_lock = threading.Lock()
@@ -276,11 +316,18 @@ class Hub(threading.Thread):
         self.lock = threading.RLock()  # held while streams are read; rebuilds swap streams under it
         self.stop_evt = threading.Event()
         self.error = None
+        self._seen = set()  # new databases seen on the last discovery pass
+
+    def _mine(self, dbs):
+        if not self.shard:
+            return dbs
+        k, n = self.shard  # scale-out: this node follows only its share of the databases
+        return [d for d in dbs if shard_of(d, n) == k]
 
     def bootstrap(self):
-        dbs = discover(self.base_dsn, self.spec)
+        dbs = self._mine(discover(self.base_dsn, self.spec))
         if not dbs:
-            raise RuntimeError(f"no databases match {self.spec!r}")
+            raise RuntimeError(f"no databases match {self.spec!r} (shard {self.shard})")
         streams = [Stream(self.engine, self.base_dsn, db, self.snap_root) for db in dbs]
         with ThreadPoolExecutor(self.workers) as ex:
             list(ex.map(lambda st: st.start(), streams))
@@ -312,6 +359,46 @@ class Hub(threading.Thread):
 
     def stream_of(self, tid):
         return self.engine.stream_of.get(tid)
+
+    # ---------- new stores while running ----------
+    def discover_new(self, now=False):
+        """Start following store databases created since startup (a new store opening). A database is picked up
+        once it has been seen on two passes in a row (or at once with now=True), so one that is still being created
+        is not caught half-way; if it is not ready (no tables yet) it is retried on the next pass."""
+        if "*" not in self.spec:
+            return []
+        try:
+            dbs = self._mine(discover(self.base_dsn, self.spec))
+        except Exception as e:
+            log.warning("store discovery failed: %s", e)
+            return []
+        added = []
+        with self.rebuild_lock:  # never races a rebuild, which takes streams out while it reloads them
+            fresh = [d for d in dbs if d not in self.streams]
+            ready = fresh if now else [d for d in fresh if d in self._seen]
+            self._seen = set(fresh)
+            for d in ready:
+                st = Stream(self.engine, self.base_dsn, d, self.snap_root)
+                try:
+                    st.start()
+                except Exception as e:
+                    st.close()
+                    log.warning("%s: new store database not ready (%s); retrying on the next pass", d, e)
+                    continue
+                with self.lock:
+                    self.streams[d] = st
+                added.append(d)
+            if added:
+                log.info("now following new store databases %s; owner index: %s", added, self.engine.build_owner())
+        return added
+
+    def start_discovery(self, interval):
+        if interval > 0 and "*" in self.spec:
+            threading.Thread(target=self._discover_loop, args=(interval,), daemon=True, name="zeta-discover").start()
+
+    def _discover_loop(self, interval):
+        while not self.stop_evt.wait(interval):
+            self.discover_new()
 
     def run(self):
         try:
@@ -354,15 +441,27 @@ class Hub(threading.Thread):
                 if st.error:
                     continue
                 try:
-                    lsn = snapshot.save(self.engine, st, self.snap_root)
+                    kind, lsn = snapshot.save(self.engine, st, self.snap_root)
                 except Exception:
                     log.exception("snapshot of %s failed", st.db)
                     continue
-                if lsn is None:
-                    skipped += 1
+                st.durable_lsn = lsn  # also when unchanged: the saved state still equals the current state
+                if kind == "saved":
+                    saved += 1
                 else:
-                    st.durable_lsn, saved = lsn, saved + 1
+                    skipped += 1
         return {"saved": saved, "skipped": skipped, "seconds": round(time.time() - t0, 2)}
+
+    def start_heartbeats(self):
+        if self.heartbeat_interval > 0:
+            threading.Thread(target=self._hb_loop, daemon=True, name="zeta-heartbeat").start()
+
+    def _hb_loop(self):
+        while not self.stop_evt.wait(self.heartbeat_interval):
+            with self.lock:
+                streams = list(self.streams.values())
+            for st in streams:
+                st.heartbeat()
 
     def start_snapshots(self):
         if self.snap_root and self.snap_interval > 0:

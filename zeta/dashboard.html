@@ -88,7 +88,11 @@ let timer = null, prev = {}, sortBy = ['revenue', -1];
 async function get(path, q = {}, method = 'GET') {
   const u = new URL(path, location.origin);
   for (const [k, v] of Object.entries(q)) if (v != null && v !== '') u.searchParams.set(k, v);
-  const r = await fetch(u, { method, headers: { 'X-API-Key': key } });
+  let r = await fetch(u, { method, headers: { 'X-API-Key': key } });
+  for (let i = 0; r.status === 429 && i < 3 && +(r.headers.get('Retry-After') || 9) <= 1; i++) {  // busy for a moment: retry
+    await new Promise(ok => setTimeout(ok, 1000 * r.headers.get('Retry-After')));
+    r = await fetch(u, { method, headers: { 'X-API-Key': key } });
+  }
   const body = await r.json();
   if (!r.ok) throw Object.assign(new Error(body.detail || r.status), { status: r.status });
   return body;

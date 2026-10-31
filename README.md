@@ -32,6 +32,8 @@ own queries and the owner's cross-store queries from memory, exactly.
 | `zeta/engine.py` | Delta engine: per-store hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new) |
 | `zeta/owner.py` | Owner index: all-store structures (hour × store × status Fenwick, day × every-product Fenwick, one time-sorted mirror of every store's rows) kept current by the same deltas, so owner queries cost about the same for 10 or 100 stores |
 | `zeta/api.py` | FastAPI: store routes, owner routes, analytics routes, `/health`, `/markers`, admin/audit, `/dashboard` |
+| `zeta/router.py` | Scale-out front door: sends a store's request to the node holding it, asks every node for owner questions and adds the answers up exactly |
+| `zeta/defs.py` | Metric definitions shared by the nodes and the router (ratios always recomputed from added parts) |
 | `zeta/audit.py` | Snapshot-exact audit **per store database** (ledger hash + count + revenue), binary-search localization, surgical bucket rebuild |
 | `zeta/guard.py` | Keys: store key bound to one store (FR-5), owner key for all stores, admin key; cost-aware token buckets (B-3) |
 | `zeta/store.html` | A store owner's own dashboard (`/store`): headline numbers vs previous period plus "Ask about your store" (any metric by status, category, product, day, hour, weekday), CSV download, the API call shown; only that store's data |
@@ -43,23 +45,39 @@ own queries and the owner's cross-store queries from memory, exactly.
 | `simulate.py` | Write traffic across the store databases (inserts, status changes, old cancellations, deletes, items, backdates) |
 | `demo_live.py` | Judge demo: one store's customers place and cancel orders; store + owner numbers vs SQL at every step |
 | `bench.py` | Benchmarks: latency + growth 1M vs 10M (store and owner), freshness, DB safety |
-| `run.sh`, `run_store.sh`, `keys.sh` | Start ZETA / the store app; print keys |
+| `setup.sh`, `requirements.txt`, `requirements.lock`, `env.sh` | One-command setup; Python dependencies (ranges / exact tested versions); shared settings (Postgres port, data dir) |
+| `run.sh`, `run_cluster.sh`, `run_store.sh`, `keys.sh` | Start ZETA (one node / several nodes + router) / the store app; print keys |
 
-## Setup (already done on this laptop)
+## Setup (one command)
 
-- Dedicated Postgres 15 cluster in `./pgdata` on **port 5433**, `wal_level=logical`, `max_replication_slots/max_wal_senders = 256`,
-  `max_connections = 400` (your normal Postgres on 5432 is untouched)
+Needs Python 3.11+ and PostgreSQL 15+ (macOS: `brew install python postgresql@15`). Then:
+
+```bash
+./setup.sh             # venv + packages, a Postgres cluster for ZETA, the key secret, 1M and 10M datasets
+./setup.sh --small     # only the 1M dataset (about 30 s)
+./setup.sh --locked    # exact tested package versions (requirements.lock)
+ZETA_PGPORT=5544 ./setup.sh --small    # use another port if 5433 is taken (then prefix the run commands the same way)
+```
+
+Safe to re-run: finished steps are skipped. Tested on a clean copy of the repo (no venv, no data, no secret, Postgres on
+5544): `--small` finished in 24 s, then a 2-node cluster on it passed 600/600 correctness and 239/239 isolation checks.
+
+What it sets up (on this laptop it already exists):
+
+- Dedicated Postgres cluster in `./pgdata` on **port 5433**, `wal_level=logical`, `max_replication_slots/max_wal_senders = 256`,
+  `max_connections = 1000` (your normal Postgres on 5432 is untouched)
 - Store databases: `t1m_001…t1m_010` (1M orders, 10 stores) and `t10m_001…t10m_100` (10M orders, 100 stores, skewed:
   store 1 = 2.3M orders, store 100 = 15.6k), loaded with
   `python split_load.py data_1m --prefix t1m` and `python split_load.py data_10m --prefix t10m`
 - `.zeta_secret` signs all keys (`./keys.sh 1 2` prints store keys plus the owner and admin keys)
-- Python venv in `.venv`
+- Python venv in `.venv` (`requirements.txt`)
 
 ## Run
 
 ```bash
 ./run.sh                          # 10 store databases (1M) on :8000
 ZETA_HOST=0.0.0.0 ./run.sh t10m 8001   # 100 store databases (10M) on :8001, reachable on the Wi-Fi
+./run_cluster.sh t10m 2 8001      # or: the same 100 stores on 2 ZETA nodes behind a router on :8001
 ./run_store.sh t10m               # optional: customer store app on :9000
 ```
 
@@ -110,7 +128,7 @@ Correctness and demo:
 
 ```bash
 .venv/bin/python harness.py --dbs 't1m_*' --n 1000 --mutate 2000
-.venv/bin/python test_isolation.py --api http://localhost:8001     # 216 isolation checks, exit code 0 = pass
+.venv/bin/python test_isolation.py --api http://localhost:8001     # 246 isolation checks, exit code 0 = pass
 .venv/bin/python harness.py --dbs 't10m_*' --api http://localhost:8001 --n 1000 --owner-n 100 --mutate 2000
 .venv/bin/python demo_live.py                    # store 5 on the 10M server, plus owner totals
 .venv/bin/python bench.py latency | freshness | safety
@@ -133,10 +151,47 @@ rebuilt from the restored stores. A missing, damaged or unusable snapshot makes 
 
 Duplicate safety: with confirmations held back (test switch `ZETA_TEST_HOLD_CONFIRM=1`), Postgres resent 600
 transactions after a crash; ZETA skipped the 300 already in the snapshot, applied the other 300, and 800/800 checks matched.
-Settings: `ZETA_SNAPSHOT_INTERVAL` (s, default 60), `ZETA_SNAPSHOTS=0` to disable, `ZETA_SNAPSHOT_DIR`.
+Only databases with new data are written: audit markers and heartbeats don't count (after 200 orders touching
+19 stores, 19 of 100 databases were saved, 0.5 s; with no new data nothing is written and the position is still confirmed).
+
+**Heartbeat:** every 5 s ZETA writes a tiny timestamped marker into each store database's WAL and times its trip
+back through the change stream, so the CDC lag is always live (median 7.8 ms, worst 15 ms at 10M) even when no
+orders arrive, and it keeps every slot's confirmed position moving (at most ~4.5 MB of WAL held back).
+
+Settings: `ZETA_SNAPSHOT_INTERVAL` (s, default 60), `ZETA_SNAPSHOTS=0` to disable, `ZETA_SNAPSHOT_DIR`,
+`ZETA_HEARTBEAT` (s, default 5, 0 = off).
 Postgres caps the WAL kept for slots at 20 GB (`max_slot_wal_keep_size`); beyond that ZETA does a full load.
 
 Reload store databases: stop ZETA, then `.venv/bin/python split_load.py data_10m --prefix t10m`.
+
+### Scale-out: several ZETA nodes behind a router
+
+One ZETA process keeps every store in memory on one machine. To grow past that, `./run_cluster.sh t10m 2 8001` starts:
+
+- **Nodes** (`:8011`, `:8012`, ...): ordinary ZETA servers, each following only its share of the store databases
+  (`ZETA_SHARD=k/N`: store database number mod N, so the few big stores land on different nodes). Each node has its
+  own change streams, snapshots, audit and heartbeat for its stores. Node 0 holds 5.8M orders, node 1 4.2M.
+- **Router** (`:8001`): the one address dashboards and API users talk to; it holds no data. A store's request
+  (`/tenants/7/...`, or anything called with store 7's key) goes to the node holding store 7. An owner's request goes
+  to every node at once (only the nodes holding the stores asked for with `stores=`), and the answers are added up:
+  counts and revenue are summed, trends merged bucket by bucket, top-N lists merged and re-ranked, and ratios
+  (average order value, cancel and return rate) recomputed from summed numerators and denominators, never averaged.
+  Operations (audit, repair, rebuild, snapshots, keys, health) are sent to every node and the results combined.
+
+Keys, dashboards and API calls are unchanged: the same URLs work against the router. Verified on 10M / 100 stores, 2 nodes:
+720/720 store and owner checks match SQL after 300 live writes; 239 isolation checks, 0 failures; every dashboard
+route (summary, store health, explore ratios by day/weekday/hour, heatmap, categories, top products) equals the sum of
+the two nodes' own answers (22/22); corrupt → audit → repair → rebuild work through the router. Owner queries through
+the router take 3–6 ms (p50) against 2–4 ms on one node; both nodes restart from snapshots in about 1.3 s.
+
+### New stores while ZETA runs
+
+Every 15 s (`ZETA_DISCOVER_INTERVAL`) each node looks for new store databases matching its pattern and its share.
+A new one is picked up on the second sighting (so a database still being created is not caught half-way): full load
+from an exported snapshot, its own replication slot, then the owner index is rebuilt. `POST /admin/discover` (owner
+key) does it at once. The router learns new stores when it meets an unknown store id, and every 30 s.
+Tested: created `t10m_101` with 40 orders while the cluster ran; it answered through the router with its own key 23 s
+later, and 480/480 checks across all 101 databases matched SQL.
 
 ## Results — one database per store
 
@@ -202,6 +257,9 @@ which exhausted Postgres's default connection limit; ZETA needs one replication 
 
 - Store key → only its own store (other store → 403); owner key → all stores and `/owner/*`; no / forged key → 401
 - Cost-aware per-store token buckets by tier (429 + `Retry-After`); the owner has its own larger bucket
+- At most a few queries **at the same time** per store (starter 2, growth 4, enterprise 8, owner 16); more get 429
+  with `Retry-After: 0.2` (the dashboards retry). 24 parallel heavy trend queries: a starter store got 7 answered and
+  17 refused, an enterprise store 14 and 10, so one store cannot take every worker
 
 ## Earlier checkpoints (single shared database, superseded)
 
@@ -218,4 +276,3 @@ Implementation notes vs the design doc:
 
 - Owner top-N edge cost follows orders per day (3.9× from 1M to 10M, 6 ms); fix: hourly per-product subtotals
 - B-4 `metrics.yaml` validator (reject non-invertible aggregates)
-- One-command setup script / docker-compose for judges on a fresh machine

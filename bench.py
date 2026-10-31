@@ -10,6 +10,7 @@ Expects ZETA on :8000 (t1m_*, 1M) and :8001 (t10m_*, 10M). Direct SQL for owner 
 owner would do without ZETA: run the query in every store database and add the answers up.
 """
 import argparse
+import os
 import multiprocessing as mp
 import random
 import subprocess
@@ -24,7 +25,7 @@ import psycopg2
 from zeta.cdc import discover
 from zeta.guard import admin_key
 
-PG = "host=localhost port=5433 user=zeta"
+PG = os.environ.get("ZETA_PG", "host=localhost port=5433 user=zeta")
 SETUPS = [("1M", "t1m", "http://localhost:8000"), ("10M", "t10m", "http://localhost:8001")]
 END = datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc)  # generator --end
 H = {"X-API-Key": admin_key()}  # admin key: not rate limited
