@@ -147,7 +147,7 @@ def bench_freshness(samples, prefix="t10m", api_url="http://localhost:8001"):
             cur.execute("SELECT pg_logical_emit_message(true, 'zeta', %s)", (token,))
             t0 = time.perf_counter()
             conn.commit()
-            while db in api.get(f"/markers/{token}").json()["missing"]:
+            while db in api.get(f"/markers/{token}", headers=H).json()["missing"]:
                 time.sleep(0.001)
             out.append((time.perf_counter() - t0) * 1000)
             time.sleep(0.02)

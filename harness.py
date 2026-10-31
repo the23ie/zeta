@@ -25,7 +25,7 @@ import httpx
 import psycopg2
 
 from zeta.cdc import discover
-from zeta.guard import owner_key, tenant_key
+from zeta.guard import admin_key, owner_key, tenant_key
 
 UTC = timezone.utc
 PG = "host=localhost port=5433 user=zeta"
@@ -46,7 +46,7 @@ def flush(conns, api):
         conn.commit()
     t0 = time.time()
     while time.time() - t0 < 120:
-        if not api.get(f"/markers/{token}").json()["missing"]:
+        if not api.get(f"/markers/{token}", headers={"X-API-Key": admin_key()}).json()["missing"]:
             return time.time() - t0
         time.sleep(0.01)
     raise TimeoutError("ZETA did not apply the marker on every store database within 120s")
@@ -278,7 +278,7 @@ def main():
           f"across {len(dbs)} store databases)")
     for r in [r for r in results if not r["ok"]][:5]:
         print("MISMATCH", r["q"], r["who"], r["range"], *r["detail"], sep="\n  ")
-    health = api.get("/health").json()
+    health = api.get("/health", headers={"X-API-Key": admin_key()}).json()
     if health.get("errors"):
         print("engine errors:", health["errors"], health["last_error"])
     sys.exit(0 if ok == len(results) else 1)

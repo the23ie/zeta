@@ -36,6 +36,8 @@ own queries and the owner's cross-store queries from memory, exactly.
 | `zeta/dashboard.html` | The one dashboard: Overview (KPIs vs previous period, trend, category mix, status, top products, weekday × hour heatmap), Stores (health table, growth, sparklines, attention flags), Explore (any metric by any dimension), Operations (B-5: CDC lag, latency, per-store audit grid, repair / rebuild) |
 | `store/` | Demo store app (customer side): pick a shop, place and cancel orders, written to that shop's database |
 | `harness.py` | Correctness: random store checks (SQL in that store's DB) and owner checks (SQL in every store DB, combined) |
+| `test_isolation.py` | Tenant isolation over every API route: wrong, forged and other stores' keys; scans responses for other stores' ids |
+| `TECHNICAL_WRITEUP.md` | Full technical write-up: every claim labelled verified / reported / assumed |
 | `simulate.py` | Write traffic across the store databases (inserts, status changes, old cancellations, deletes, items, backdates) |
 | `demo_live.py` | Judge demo: one store's customers place and cancel orders; store + owner numbers vs SQL at every step |
 | `bench.py` | Benchmarks: latency + growth 1M vs 10M (store and owner), freshness, DB safety |
@@ -91,6 +93,7 @@ Correctness and demo:
 
 ```bash
 .venv/bin/python harness.py --dbs 't1m_*' --n 1000 --mutate 2000
+.venv/bin/python test_isolation.py --api http://localhost:8001     # 216 isolation checks, exit code 0 = pass
 .venv/bin/python harness.py --dbs 't10m_*' --api http://localhost:8001 --n 1000 --owner-n 100 --mutate 2000
 .venv/bin/python demo_live.py                    # store 5 on the 10M server, plus owner totals
 .venv/bin/python bench.py latency | freshness | safety

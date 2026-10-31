@@ -9,17 +9,21 @@ Store routes (key bound to that store, or the owner/admin key):
   GET  /tenants/{id}/products/top?from&to&n=10
 
 Owner routes (the company that owns every store; owner or admin key), aggregated across all store databases:
-  GET  /owner/stores
+  GET  /owner/stores                        (a store key sees only its own store)
   GET  /owner/orders/count?from&to&status&stores=1,2
   GET  /owner/orders/by-store?from&to&status
   GET  /owner/orders/by-status?from&to&stores
   GET  /owner/orders/trend?from&to&granularity&status&stores
   GET  /owner/products/top?from&to&n&stores
-  GET  /dashboard?key=<owner key>           owner's live dashboard
+  GET  /dashboard?key=<owner key>           the one dashboard (a store key opens it for its own store)
 
-Operations (admin key):
-  GET  /health                              per-database streams, freshness
-  GET  /monitor?key=<admin key>             live page (B-5)
+Analytics (owner/admin key; a store key is limited to its own store):
+  GET  /analytics/summary | /analytics/stores | /analytics/explore | /analytics/heatmap
+
+Operations (owner or admin key):
+  GET  /health                              {"ok"} for anyone; per-database detail with an owner/admin key
+  GET  /markers/{token}                     which store databases have applied a WAL marker
+  GET  /monitor.json                        data for the dashboard's Operations tab (/monitor redirects there)
   GET  /admin/audit | POST /admin/audit?localize&repair
   POST /admin/corrupt?tenant=1              demo: damage one hour bucket
   POST /admin/rebuild[?tenant=7]            rebuild one store database (or all) from a fresh snapshot (B-2)
@@ -293,11 +297,12 @@ def products_top(tid: int, request: Request, response: Response,
 # ---------------- owner routes: aggregate across every store database ----------------
 
 @app.get("/owner/stores")
-def owner_stores(request: Request, response: Response):
-    admit_owner(request, response, "count", MIN_US, MIN_US, None)
+def owner_stores(request: Request, response: Response, stores: Optional[str] = None):
+    """The stores a key may see: every store for the owner/admin, only its own store for a store key."""
+    tids = admit_owner(request, response, "count", MIN_US, MIN_US, stores)
     return [{"tenant_id": tid, "name": engine.names.get(tid), "tier": engine.tiers.get(tid),
              "database": engine.stream_of[tid].db if tid in engine.stream_of else None}
-            for tid in sorted(engine.tenants)]
+            for tid in tids]
 
 
 @app.get("/owner/orders/count")
@@ -435,12 +440,13 @@ def analytics_summary(request: Request, response: Response, from_: Optional[str]
 
 @app.get("/analytics/stores")
 def analytics_stores(request: Request, response: Response, from_: Optional[str] = Query(None, alias="from"),
-                     to: Optional[str] = None, spark_days: int = Query(14, ge=2, le=60)):
+                     to: Optional[str] = None, spark_days: int = Query(14, ge=2, le=60),
+                     stores: Optional[str] = None):
     """Store health: KPIs per store, growth vs the previous period, a daily sparkline, attention flags."""
     t0 = time.perf_counter()
     fu, tu = parse_range(from_, to)
     _require_range(fu, tu)
-    tids = admit_owner(request, response, "count", fu, tu, None)
+    tids = admit_owner(request, response, "count", fu, tu, stores)
     cur, prev = engine.owner_count(tids, fu, tu), engine.owner_count(tids, 2 * fu - tu, fu)
     all_k = _kpis(sum(cur.values(), np.zeros((2, len(STATUSES)), np.int64)))
     day0 = (tu - 1) // DAY * DAY - (spark_days - 1) * DAY
@@ -539,8 +545,19 @@ def analytics_heatmap(request: Request, response: Response, from_: Optional[str]
 
 # ---------------- health / admin / monitoring ----------------
 
+def _is_operator(request):
+    return not guard.AUTH or guard.check_key(_key(request)) in ("admin", "owner")
+
+
 @app.get("/health")
-def health():
+def health(request: Request):
+    """Public liveness ({"ok": ...}) for anyone; per-database detail only for the owner or admin,
+    because it names every store database and its size."""
+    full = _health()
+    return full if _is_operator(request) else {"ok": full["ok"]}
+
+
+def _health():
     with hub.lock:
         streams = list(hub.streams.values())
     s = dict(engine.stats)
@@ -560,8 +577,9 @@ def health():
 
 
 @app.get("/markers/{token}")
-def marker(token: str):
+def marker(token: str, request: Request):
     """Which store databases' streams have applied this WAL marker (used to wait for 'caught up')."""
+    require_admin(request)
     with hub.lock:
         streams = list(hub.streams.values())
     missing = [st.db for st in streams if token not in st.markers]
@@ -612,7 +630,7 @@ def monitor_json(request: Request):
                   "rejected_429": sum(1 for _, c in v if c == 429)}
            for path, v in sorted(LAT.items())}
     a = auditor.last
-    h = health()
+    h = _health()
     h.pop("streams")
     h.pop("markers")
     return {"uptime_s": round(time.time() - STARTED), "health": h, "latency": lat,
