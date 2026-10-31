@@ -2,137 +2,170 @@
 
 Design: [ZETA_DESIGN.md](ZETA_DESIGN.md). This README tracks what is built and how to run it.
 
+**Setting (from the PRD):** each store (tenant) has its orders, products and customers in **its own database**,
+and the company owner, who owns every store, wants one dashboard across all of them. ZETA sits between the
+store databases and the dashboards: it follows every store database's change stream and answers the store's
+own queries and the owner's cross-store queries from memory, exactly.
+
+```
+ Store app (customers)            one Postgres database per store
+   ├─ store 1 ──writes──►  t10m_001 ──┐
+   ├─ store 2 ──writes──►  t10m_002 ──┤  one logical replication stream per database
+   │   ...                   ...      │  (WAL → test_decoding → Z-set deltas)
+   └─ store 100 ─writes──► t10m_100 ──┘
+                                      ▼
+                         ZETA (one process, in memory)
+                           per-store Fenwick trees + mirror
+                           owner = exact sum across stores
+                                      ▼
+            /tenants/{id}/...  (a store's own numbers, store key)
+            /owner/...         (all stores, owner key) + /dashboard
+```
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `zeta/engine.py` | Delta engine: per-tenant hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new) |
-| `zeta/cdc.py` | Snapshot-exact bootstrap (`CREATE_REPLICATION_SLOT … EXPORT_SNAPSHOT` → `SET TRANSACTION SNAPSHOT`) and the logical replication stream (`test_decoding`, built into Postgres) |
-| `zeta/api.py` | FastAPI: the 4 FR-7 endpoints + `/health`, admin/audit endpoints, `/monitor`; every response carries freshness (`as_of_lsn`, `cdc_lag_ms`) |
-| `zeta/audit.py` | Snapshot-exact audit (ledger hash + count + revenue per tenant), binary-search localization, surgical bucket rebuild |
-| `zeta/guard.py` | API keys bound to one tenant (FR-5) and cost-aware per-tenant token buckets by tier (B-3) |
-| `zeta/monitor.html` | `/monitor` page (B-5): CDC lag, latency p50/p99, per-tenant audit grid, demo buttons |
-| `bench.py` | Benchmarks: latency + growth 1M vs 10M, freshness, DB safety |
-| `harness.py` | Correctness harness: N random (tenant, range, query) checks vs direct SQL, optionally after a burst of writes |
-| `simulate.py` | Store-app write traffic (inserts, status changes, old-order cancellations, deletes, item add/remove, backdated `created_at`) |
-| `load.sh` | Loads a generated dataset (replaces `load.sql`, whose `\copy … :'var'` does not interpolate in psql 15) |
-| `run.sh` | Starts Postgres if needed and serves ZETA |
+| `split_load.py` | Loads the organisers' CSVs as **one Postgres database per store** (`t1m_001…t1m_010`, `t10m_001…t10m_100`) |
+| `zeta/cdc.py` | One `Stream` per store database (own replication slot, snapshot-exact bootstrap, freshness) and a `Hub` thread that follows all of them |
+| `zeta/engine.py` | Delta engine: per-store hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new); owner aggregation across stores |
+| `zeta/api.py` | FastAPI: store routes, owner routes, `/health`, `/markers`, admin/audit, `/monitor`, `/dashboard` |
+| `zeta/audit.py` | Snapshot-exact audit **per store database** (ledger hash + count + revenue), binary-search localization, surgical bucket rebuild |
+| `zeta/guard.py` | Keys: store key bound to one store (FR-5), owner key for all stores, admin key; cost-aware token buckets (B-3) |
+| `zeta/dashboard.html` | Owner dashboard (all stores, store filter, per-store breakdown, live) |
+| `zeta/monitor.html` | `/monitor` page (B-5): CDC lag, latency p50/p99, per-store audit grid, demo buttons |
+| `store/` | Demo store app (customer side): pick a shop, place and cancel orders, written to that shop's database |
+| `harness.py` | Correctness: random store checks (SQL in that store's DB) and owner checks (SQL in every store DB, combined) |
+| `simulate.py` | Write traffic across the store databases (inserts, status changes, old cancellations, deletes, items, backdates) |
+| `demo_live.py` | Judge demo: one store's customers place and cancel orders; store + owner numbers vs SQL at every step |
+| `bench.py` | Benchmarks: latency + growth 1M vs 10M (store and owner), freshness, DB safety |
+| `run.sh`, `run_store.sh`, `keys.sh` | Start ZETA / the store app; print keys |
 
 ## Setup (already done on this laptop)
 
-- Dedicated Postgres 15 cluster in `./pgdata` on **port 5433**, `wal_level=logical` (your normal Postgres on 5432 is untouched)
-- Databases: `zeta` = 1M orders / 10 tenants, `zeta10m` = 10M orders / 100 tenants (both generated with `--end 2026-10-31T09:00:00`)
+- Dedicated Postgres 15 cluster in `./pgdata` on **port 5433**, `wal_level=logical`, `max_replication_slots/max_wal_senders = 256`,
+  `max_connections = 400` (your normal Postgres on 5432 is untouched)
+- Store databases: `t1m_001…t1m_010` (1M orders, 10 stores) and `t10m_001…t10m_100` (10M orders, 100 stores, skewed:
+  store 1 = 2.3M orders, store 100 = 15.6k), loaded with
+  `python split_load.py data_1m --prefix t1m` and `python split_load.py data_10m --prefix t10m`
+- `.zeta_secret` signs all keys (`./keys.sh 1 2` prints store keys plus the owner and admin keys)
 - Python venv in `.venv`
 
 ## Run
 
 ```bash
-./run.sh                 # 1M db on :8000
-./run.sh zeta10m 8001    # 10M db on :8001
+./run.sh                          # 10 store databases (1M) on :8000
+ZETA_HOST=0.0.0.0 ./run.sh t10m 8001   # 100 store databases (10M) on :8001, reachable on the Wi-Fi
+./run_store.sh t10m               # optional: customer store app on :9000
 ```
 
-Every tenant route needs a key bound to that tenant (`.venv/bin/python -m zeta.guard 1 2` prints keys for tenants 1, 2 and the admin key):
+- Owner dashboard: `http://localhost:8001/dashboard?key=<owner key>`
+- Monitor: `http://localhost:8001/monitor?key=<admin key>`
+- Customer store: `http://localhost:9000/?shop=7`
+
+API (`from`/`to` ISO-8601, naive = UTC, range `[from, to)`, trend buckets UTC):
 
 ```bash
-K=$(.venv/bin/python -c "from zeta.guard import tenant_key; print(tenant_key(1))")
-curl -H "X-API-Key: $K" "localhost:8000/tenants/1/orders/count?from=2026-10-01T10:15:30Z&to=2026-10-20T03:00:01Z"
-curl -H "X-API-Key: $K" "localhost:8000/tenants/1/orders/by-status?from=2026-10-01&to=2026-10-08"
-curl -H "X-API-Key: $K" "localhost:8000/tenants/1/orders/trend?from=2026-10-25&to=2026-10-31&granularity=hour"
-curl -H "X-API-Key: $K" "localhost:8000/tenants/1/products/top?from=2026-10-01&to=2026-10-31&n=10"
-curl "localhost:8000/health"
+K=$(./keys.sh 1 | awk '/tenant/{print $3}')     # store 1's key
+O=$(./keys.sh | awk '/owner/{print $2}')        # owner key
+curl -H "X-API-Key: $K" "localhost:8001/tenants/1/orders/count?from=2026-10-24&to=2026-10-31"
+curl -H "X-API-Key: $K" "localhost:8001/tenants/1/orders/by-status?from=2026-10-24"
+curl -H "X-API-Key: $K" "localhost:8001/tenants/1/orders/trend?from=2026-10-01&granularity=day"
+curl -H "X-API-Key: $K" "localhost:8001/tenants/1/products/top?from=2026-10-24&n=10"
+curl -H "X-API-Key: $O" "localhost:8001/owner/orders/count?from=2026-10-24"
+curl -H "X-API-Key: $O" "localhost:8001/owner/orders/by-store?from=2026-10-24"
+curl -H "X-API-Key: $O" "localhost:8001/owner/orders/by-status?from=2026-10-24&stores=1,2,3"
+curl -H "X-API-Key: $O" "localhost:8001/owner/orders/trend?from=2026-10-01&granularity=day"
+curl -H "X-API-Key: $O" "localhost:8001/owner/products/top?from=2026-10-24&n=10"
 ```
 
-Monitor: open `http://localhost:8001/monitor?key=<admin key>` (the server also logs the URL at startup).
-Set `ZETA_AUTH=0` / `ZETA_LIMITS=0` to turn keys / limits off, `ZETA_AUDIT_INTERVAL` (seconds, default 60, 0 = off).
-
-`from`/`to`: ISO-8601, naive = UTC, range is `[from, to)`. Trend buckets are UTC.
-
-Correctness:
+Correctness and demo:
 
 ```bash
-.venv/bin/python harness.py --n 1000                    # read-only
-.venv/bin/python harness.py --n 1000 --mutate 3000      # after 3000 live write transactions
-.venv/bin/python harness.py --dsn "host=localhost port=5433 user=zeta dbname=zeta10m" --api http://localhost:8001 --n 1000 --mutate 3000
+.venv/bin/python harness.py --dbs 't1m_*' --n 1000 --mutate 2000
+.venv/bin/python harness.py --dbs 't10m_*' --api http://localhost:8001 --n 1000 --owner-n 100 --mutate 2000
+.venv/bin/python demo_live.py                    # store 5 on the 10M server, plus owner totals
+.venv/bin/python bench.py latency | freshness | safety
 ```
 
-Live judge demo (one tenant's customers place orders, cancel some; latency + SQL match at every step):
+Reload store databases: stop ZETA, then `.venv/bin/python split_load.py data_10m --prefix t10m`.
 
-```bash
-.venv/bin/python demo_live.py                          # tenant 5 on the 10M server
-.venv/bin/python demo_live.py --tenant 1 --orders 3 --cancel 2
-```
+## Results — one database per store
 
-Sample run (10M): commit → visible in ZETA's API in 5.6–24.2 ms (median 16 ms) across 7 changes; count,
-revenue and top-3 products matched direct SQL after every step; a cancel retracted the product's sales to the
-exact previous value; tenant 2 unchanged and tenant 5's key rejected on tenant 2 (403); demo orders deleted at the end.
+### Correctness (`harness.py`)
 
-Reset a database: stop its ZETA server, then `./load.sh data_1m zeta`.
+| Run | Checks | Match |
+|---|---|---|
+| 1M, 10 store DBs, after 2000 live writes | 1000 store + 200 owner | **1200/1200** |
+| 10M, 100 store DBs, after 2000 live writes across 49 DBs | 1000 store + 100 owner | **1100/1100** |
+| 10M, after rebuilding store 7's database during live writes | 400 store + 60 owner | **460/460** |
 
-## Checkpoint 1 — Sat 31 Oct, 5 pm (P0 done)
+- Audit runs per store database at that database's MVCC snapshot (100 snapshots, ~12 s per full sweep on 10M), green throughout
+- Corrupt demo (store 3, 10M): audit red → binary search found the exact hour (17 Sep 13:00) with 15 range queries → rebuilt from the mirror → green
+- `POST /admin/rebuild?tenant=7` rebuilt only `t10m_007` in 1.2 s while the other 99 stores kept streaming
+- `demo_live.py` (store 5): each order / cancel visible in the store's numbers and in the owner's all-store total in 8–20 ms; both matched SQL (the owner total against SQL run in all 100 databases) at every step
 
-| Run | Checks | Match | Engine p50 (count / top / trend-hour) | API p50 via HTTP | Catch-up after writes |
-|---|---|---|---|---|---|
-| 1M, read-only | 1000 | **1000** | 0.043 / 0.135 / 0.317 ms | 0.5–1.9 ms | — |
-| 1M, after 3000 writes | 1000 | **1000** | 0.035 / 0.097 / 0.292 ms | 0.5–1.6 ms | 25 ms |
-| 10M, after 3000 writes | 1000 | **1000** | 0.052 / 0.135 / 0.361 ms | 0.5–2.0 ms | 29 ms |
+### Speed + Growth (`bench.py latency`)
 
-- Bootstrap: 1M in 2.1 s, 10M orders + 16M items in 12.3 s
-- Growth 1M → 10M: engine latency ≈ 1.2–1.5× (cost depends on time buckets, not rows)
-- Writes covered: new orders, late orders with past µs timestamps, status changes on recent and 60-day-old orders, deletes, items added/removed on existing orders, `created_at` moved (including outside the bucket axis)
+Store rows = the biggest store (374k orders at 1M, 2.3M at 10M). OWNER rows = all stores (10 databases at 1M, 100 at 10M).
+SQL for OWNER rows = the same question run in every store database and added up (what the owner does without ZETA).
+
+| Query | ZETA p50 1M | ZETA p50 10M | ZETA p99 10M | Growth | SQL p50 1M | SQL p50 10M |
+|---|---|---|---|---|---|---|
+| count 7d | 0.99 ms | 0.93 ms | 1.98 ms | 0.94× | 4.0 ms | 16.5 ms |
+| count 90d | 0.98 ms | 0.88 ms | 1.07 ms | 0.90× | 19.6 ms | 110 ms |
+| by-status 30d | 0.99 ms | 0.92 ms | 1.43 ms | 0.93× | 20.3 ms | 102 ms |
+| trend hour 3d | 1.56 ms | 1.50 ms | 2.18 ms | 0.96× | 4.2 ms | 28 ms |
+| trend day 90d | 1.96 ms | 2.19 ms | 3.19 ms | 1.11× | 111 ms | 605 ms |
+| top10 30d | 1.16 ms | 1.60 ms | 2.05 ms | 1.38× | 59 ms | 565 ms |
+| top10 90d | 1.13 ms | 1.88 ms | 3.41 ms | 1.65× | 88 ms | 729 ms |
+| OWNER count 7d | 1.15 ms | 3.27 ms | 3.87 ms | 2.84× | 121 ms | 570 ms |
+| OWNER by-store 30d | 1.30 ms | 4.52 ms | 5.04 ms | 3.49× | 130 ms | 1,320 ms |
+| OWNER trend day 90d | 2.53 ms | 10.2 ms | 16.0 ms | 4.05× | 317 ms | 5,425 ms |
+| OWNER top10 30d | 1.87 ms | 11.8 ms | 18.0 ms | 6.33× | 332 ms | 6,507 ms |
+
+Store queries: flat (≤ 1.65×). Owner queries: all far under 200 ms, but their cost grows with the **number of
+stores** (10 → 100), not with rows: each owner answer adds up every store's structures.
+
+### Freshness (`bench.py freshness`): order committed in `t10m_001` → visible in ZETA
+
+| | p50 | p99 |
+|---|---|---|
+| idle | 9.6 ms | 18.7 ms |
+| under 300 write tx/s across all stores | 11.9 ms | 27.3 ms |
+
+### DB safety (`bench.py safety`, 100 store DBs, 4 app workers, 4 dashboard users × 10 refresh/s, 70 s each)
+
+Half the dashboard refreshes are a store's own numbers, half are the owner's all-store numbers. ZETA (CDC + its
+60 s audit) runs in all three scenarios.
+
+| Scenario | App p50 | App p99 | Δp50 | Δp99 | Postgres CPU | Dashboard q/s served |
+|---|---|---|---|---|---|---|
+| no dashboards | 0.43 ms | 6.03 ms | — | — | 1.6 cores | 0 |
+| dashboards on ZETA | 0.39 ms | 5.34 ms | −9% | −11% (noise) | 1.3 cores | 40.5 (all offered) |
+| dashboards on direct SQL | 1.00 ms | 14.04 ms | +133% | +133% | 4.1 cores | 1.1 (saturated) |
+
+Direct SQL for an owner dashboard also needs a connection to every store database per user (100 per user here),
+which exhausted Postgres's default connection limit; ZETA needs one replication connection per store database in total.
+
+### Isolation + limits
+
+- Store key → only its own store (other store → 403); owner key → all stores and `/owner/*`; no / forged key → 401
+- Cost-aware per-store token buckets by tier (429 + `Retry-After`); the owner has its own larger bucket
+
+## Earlier checkpoints (single shared database, superseded)
+
+Checkpoint 1 (31 Oct, 5 pm) and checkpoint 2 used one shared database with `tenant_id` (`zeta`, `zeta10m`).
+Results there: 1000/1000 correctness on 1M and 10M after live writes; store queries 0.5–1.1 ms at 10M with
+1.00–1.34× growth; freshness 8 ms p50; app latency unchanged with dashboards on ZETA. Those numbers are kept in git history.
 
 Implementation notes vs the design doc:
 - `test_decoding` instead of `wal2json` (ships with Postgres, nothing to install; same information: old row via `REPLICA IDENTITY FULL`, xids, commit timestamps)
 - Mirror is in-memory numpy (sorted columns + CSR items) instead of SQLite: edges are a `searchsorted` + `bincount`
 - Native Postgres instead of docker-compose (Docker daemon was not running)
 
-## Checkpoint 2 — Sun 1 Nov, 10 am (P1 + P2, built early)
+## Still open
 
-### Speed + Growth (`bench.py latency`, tenant 1: 374k orders at 1M, 2.3M at 10M)
-
-| Query | ZETA p50 1M | ZETA p50 10M | ZETA p99 10M | Growth | SQL p50 1M | SQL p50 10M |
-|---|---|---|---|---|---|---|
-| count 7d | 0.54 ms | 0.54 ms | 0.65 ms | 1.02× | 2.0 ms | 8.7 ms |
-| count 90d | 0.53 ms | 0.53 ms | 0.60 ms | 1.00× | 19.9 ms | 184 ms |
-| by-status 30d | 0.55 ms | 0.55 ms | 0.75 ms | 1.00× | 8.2 ms | 45 ms |
-| trend hour 3d | 0.82 ms | 0.82 ms | 0.91 ms | 1.00× | 2.0 ms | 12 ms |
-| trend day 90d | 0.94 ms | 1.10 ms | 1.15 ms | 1.17× | 53 ms | 326 ms |
-| top10 30d | 0.64 ms | 0.86 ms | 0.99 ms | 1.34× | 47 ms | 677 ms |
-| top10 90d | 0.64 ms | 0.85 ms | 0.90 ms | 1.31× | 77 ms | 884 ms |
-
-HTTP round trip from a client on the same laptop; engine time alone is 0.03–0.3 ms.
-
-### Freshness (`bench.py freshness`, 10M): order committed → visible in ZETA
-
-| | p50 | p99 |
-|---|---|---|
-| idle | 7.8 ms | 17.4 ms |
-| under 300 write tx/s | 11.6 ms | 25.3 ms |
-
-### DB safety (`bench.py safety`, 10M, 4 app workers, 8 dashboard users × 5 refresh/s offered)
-
-| Scenario | App p50 | App p99 | Δp50 | Δp99 | Postgres CPU | Dashboard q/s served |
-|---|---|---|---|---|---|---|
-| no dashboards | 0.28 ms | 1.93 ms | — | — | ~0.5 cores | 0 |
-| dashboards on ZETA | 0.28 ms | 1.74 ms | −1% | −10% (noise) | ~0.2 cores | 42 (all offered) |
-| dashboards on direct SQL | 0.63 ms | 12.18 ms | +124% | +532% | 6.9 cores | 7 (saturated) |
-
-The periodic audit costs one ~3.5 s aggregate query per minute on 10M (md5 over every row), ≈ 0.6% of this 10-core machine.
-
-### Correctness, audit, rebuild
-
-- Harness after the P1/P2 changes, using per-tenant keys: 1000/1000 on 1M and 1000/1000 on 10M, both after 2000 live writes; audit green on both
-- Snapshot-exact audit while 400 tx/s stream in: green every time, ~130 newer transactions subtracted per audit
-- Corrupt demo (10M, tenant 1): audit red → binary search finds the exact hour with 15 range queries → bucket rebuilt from mirror → green. Also run from the `/monitor` buttons
-- Full rebuild (`POST /admin/rebuild`) during live writes: 2.1 s on 1M, harness still 1000/1000 afterwards
-
-### Isolation + limits
-
-- No key / forged key → 401; another tenant's key → 403
-- Cost known before running: 1-hour count = 1.2 units, 90-day top-N with wide edges = 274 units
-- Tenant 2 bursting 400 wide top-N queries: 163 served, 237 rejected with `429 + Retry-After`; tenant 3 unaffected
-
-### Still open (P2)
-
+- Owner queries cost grows with the number of stores (see Growth above); fix: a global time index over all stores
 - B-4 `metrics.yaml` validator (reject non-invertible aggregates)
-- `?as_of=` time travel (the per-xid delta log used by the audit is the building block)
-- docker-compose packaging (Docker daemon not running on this laptop)
+- One-command setup script / docker-compose for judges on a fresh machine

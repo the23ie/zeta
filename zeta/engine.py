@@ -381,6 +381,8 @@ class Engine:
         self.headroom_days, self.lead_days = headroom_days, lead_days
         self.tenants = {}
         self.tiers = {}
+        self.names = {}
+        self.stream_of = {}  # tenant id -> the store database stream it lives in
         self.epoch = 0
         self.T = 0
         self.recent = deque(maxlen=500_000)  # (xid, [(tid, hour|None, d_count, d_revenue, d_hash)])
@@ -402,11 +404,13 @@ class Engine:
                              convert_options=pacsv.ConvertOptions(column_types=ct))
         return {n: (tbl[n].to_numpy() if ct[n] == pa.int64() else tbl[n].to_pylist()) for n in names}
 
-    def bootstrap(self, cur):
-        """Build all state from the snapshot `cur` is reading in."""
+    def bootstrap(self, cur, stream=None):
+        """Build the state of every store in the database `cur` reads (at its snapshot) and merge it in.
+        Stores in other databases are untouched, so one store database can be rebuilt on its own."""
         t0 = time.time()
         status_case = "CASE status " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(STATUSES)) + " END"
-        tenants = self._copy(cur, "SELECT tenant_id, tier FROM tenants", ["tid", "tier"], {"tier": pa.string()})
+        tenants = self._copy(cur, "SELECT tenant_id, tier, name FROM tenants", ["tid", "tier", "name"],
+                             {"tier": pa.string(), "name": pa.string()})
         prods = self._copy(cur, "SELECT product_id, tenant_id, name FROM products ORDER BY tenant_id, product_id",
                            ["pid", "tid", "name"], {"name": pa.string()})
         o = self._copy(cur, f"SELECT order_id, tenant_id, {status_case}, total_cents, "
@@ -485,12 +489,22 @@ class Engine:
             tenants_new[tid] = t
 
         with self.lock:
-            self.tenants, self.epoch, self.T = tenants_new, epoch, T
-            self.tiers = dict(zip(tenants["tid"].tolist(), tenants["tier"]))
-            self.recent.clear()
-            self.stats.update(bootstrapped_at=time.time(), bootstrap_s=round(time.time() - t0, 2),
-                              bootstrap_read_s=round(t_read, 2), orders=int(len(o["oid"])),
-                              items=int(len(it["oid"])))
+            rebuilt = set(tenants_new)
+            self.tenants.update(tenants_new)
+            if not self.T:
+                self.epoch, self.T = epoch, T
+            self.tiers.update(zip(tenants["tid"].tolist(), tenants["tier"]))
+            self.names.update(zip(tenants["tid"].tolist(), tenants["name"]))
+            if stream is not None:
+                stream.tids = sorted(rebuilt)
+                for tid in rebuilt:
+                    self.stream_of[tid] = stream
+            # audit log entries of rebuilt stores are now part of their base state
+            self.recent = deque(((x, [e for e in es if e[0] not in rebuilt]) for x, es in self.recent),
+                                maxlen=self.recent.maxlen)
+            self.stats["bootstrapped_at"] = time.time()
+        return {"orders": int(len(o["oid"])), "items": int(len(it["oid"])),
+                "bootstrap_s": round(time.time() - t0, 2), "read_s": round(t_read, 2)}
 
     # ---------- applying CDC transactions ----------
     def tenant(self, tid):
@@ -499,7 +513,7 @@ class Engine:
             t = self.tenants[tid] = Tenant(tid, self.epoch, self.T)
         return t
 
-    def apply_txn(self, changes, lsn, xid, commit_us):
+    def apply_txn(self, changes, lsn, xid, commit_us, stream=None):
         with self.lock:
             self._txlog = []
             for ch in changes:
@@ -516,6 +530,14 @@ class Engine:
             if commit_us is not None:
                 self.stats["last_commit_ts"] = commit_us / 1e6
                 self.stats["lag_ms"] = round(now * 1000 - commit_us / 1000, 1)
+            if stream is not None:
+                stream.applied_lsn, stream.last_apply_wall, stream.txns = lsn, now, stream.txns + 1
+                if commit_us is not None:
+                    stream.last_commit_ts, stream.lag_ms = commit_us / 1e6, self.stats["lag_ms"]
+                for ch in changes:
+                    if ch[0] == "MESSAGE":
+                        stream.last_marker = ch[3]
+                        stream.markers.append(ch[3])
 
     def _apply(self, ch):
         kind, table, old, new = ch
@@ -634,16 +656,49 @@ class Engine:
             v[0, 3], v[1, 3] = 1, 4999  # one phantom cancelled order
             t.hour_raw[h] += v
             t.hour.add(h, v)
-            return h, self.epoch + h * HOUR
+            return h, t.epoch + h * HOUR
+
+    @staticmethod
+    def _topn(ten, v, n):
+        pos = np.flatnonzero(v > 0)
+        if len(pos) > n:
+            kth = np.partition(v[pos], len(pos) - n)[len(pos) - n]
+            pos = pos[v[pos] >= kth]
+        order = np.lexsort((ten.pid_arr[pos], -v[pos]))[:n]
+        return [(int(ten.pid_arr[i]), ten.pid_names[i], int(v[i])) for i in pos[order]]
 
     def top(self, tid, f, t, n):
         with self.lock:
             ten = self.get(tid)
-            v = ten.range_products(f, t)
-            pos = np.flatnonzero(v > 0)
-            if len(pos) > n:
-                kth = np.partition(v[pos], len(pos) - n)[len(pos) - n]
-                pos = pos[v[pos] >= kth]
-            order = np.lexsort((ten.pid_arr[pos], -v[pos]))[:n]
-            pos = pos[order]
-            return [(int(ten.pid_arr[i]), ten.pid_names[i], int(v[i])) for i in pos]
+            return self._topn(ten, ten.range_products(f, t), n)
+
+    # ---------- owner: one company owns every store; aggregate across store databases ----------
+    def owner_count(self, tids, f, t):
+        """{tid: [2, NS] vector} for each store; the owner's totals are their sum (exact)."""
+        with self.lock:
+            return {tid: self.tenants[tid].range_status(f, t) for tid in tids if tid in self.tenants}
+
+    def owner_trend(self, tids, f, t, step):
+        with self.lock:
+            parts = [self.tenants[tid].trend(f, t, step) for tid in tids if tid in self.tenants]
+        parts = [(s, v) for s, v in parts if len(s)]
+        if not parts:
+            return np.zeros(0, np.int64), np.zeros((0, 2, NS), np.int64)
+        # every store's buckets are UTC-aligned multiples of `step`, so they line up by index
+        idx = [s // step for s, _ in parts]
+        lo, hi = min(int(i[0]) for i in idx), max(int(i[-1]) for i in idx)
+        acc = np.zeros((hi - lo + 1, 2, NS), np.int64)
+        for i, (_, v) in zip(idx, parts):
+            np.add.at(acc, i - lo, v)
+        return np.arange(lo, hi + 1, dtype=np.int64) * step, acc
+
+    def owner_top(self, tids, f, t, n):
+        """Exact top-N across stores: the global top N is inside the union of each store's top N."""
+        with self.lock:
+            cands = []
+            for tid in tids:
+                ten = self.tenants.get(tid)
+                if ten is not None:
+                    cands += [(-s, pid, name, tid) for pid, name, s in self._topn(ten, ten.range_products(f, t), n)]
+        cands.sort()
+        return [(pid, name, -neg, tid) for neg, pid, name, tid in cands[:n]]

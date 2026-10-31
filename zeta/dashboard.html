@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Owner Dashboard</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1b; --ink2:#4a4a46; --muted:#6b6b66; --line:#e3e3de; --grid:#ededea;
+          --bar:#3b5bdb; --soft:#e8edff; --flash:#fff3c4; --bad:#c23b3b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141413; --card:#1e1e1c; --ink:#ececea; --ink2:#c9c9c4; --muted:#9a9a94; --line:#33332f; --grid:#2a2a27;
+            --bar:#7c94ff; --soft:#232a45; --flash:#4a3f12; --bad:#ff7b7b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:1150px; margin:0 auto; padding:18px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:10px; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 10px; }
+  .muted { color:var(--muted); font-size:12px; }
+  .fresh { font-size:12px; color:var(--muted); text-align:right; }
+  .filters { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+  select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-bottom:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; transition:background .6s; min-width:0; }
+  .card.flash { background:var(--flash); transition:none; }
+  .k { color:var(--muted); font-size:12px; } .v { font-size:24px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .sub { color:var(--ink2); font-size:13px; font-variant-numeric:tabular-nums; }
+  .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:12px; margin-bottom:12px; }
+  @media (max-width:860px) { .grid2 { grid-template-columns:1fr; } }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:right; vertical-align:middle; }
+  td:first-child, th:first-child { text-align:left; } th { color:var(--muted); font-weight:500; font-size:12px; }
+  .barcell { width:32%; } .hbar { height:10px; background:var(--bar); border-radius:0 4px 4px 0; min-width:1px; }
+  tr.click { cursor:pointer; } tr.click:hover td { background:var(--soft); }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { border:0; background:transparent; color:var(--ink2); padding:4px 10px; font:inherit; cursor:pointer; }
+  .seg button.on { background:var(--soft); color:var(--ink); font-weight:600; }
+  #chart { position:relative; } svg text { fill:var(--muted); font-size:11px; }
+  .tip { position:absolute; pointer-events:none; background:var(--ink); color:var(--bg); font-size:12px; padding:5px 8px; border-radius:6px; white-space:nowrap; transform:translate(-50%, -110%); display:none; }
+  .login { max-width:460px; margin:60px auto; }
+  input { font:inherit; width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); margin:8px 0; }
+  button.primary { background:var(--bar); color:#fff; border:0; border-radius:8px; padding:8px 14px; font:inherit; cursor:pointer; }
+  .err { color:var(--bad); }
+  .scroll { max-height:420px; overflow:auto; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const $ = id => document.getElementById(id);
+const rupees = c => '₹' + (c / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const num = n => n.toLocaleString('en-IN');
+const STATUSES = ['placed', 'shipped', 'delivered', 'cancelled', 'returned'];
+const params = new URLSearchParams(location.search);
+const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+let key = params.get('key') || store.get('zeta-owner-key');
+let gran = 'hour', range = 'today', pick = '', prev = {}, lastChange = null, stores = [], timer = null;
+
+function loginForm(msg) {
+  clearInterval(timer);
+  $('app').innerHTML = `<div class="card login"><h1>Owner dashboard</h1>
+    <p class="muted">Paste the owner key (zo_…). It opens every store's numbers, aggregated across all store databases.</p>
+    <input id="k" placeholder="zo_…" value="${key || ''}"><button class="primary" onclick="useKey()">Open dashboard</button>
+    ${msg ? `<p class="err">${msg}</p>` : ''}</div>`;
+}
+function useKey() { key = $('k').value.trim(); store.set('zeta-owner-key', key); start(); }
+
+function shell() {
+  $('app').innerHTML = `
+  <header><div><h1>All stores</h1><div class="muted" id="subtitle">Live from ZETA · aggregated across every store database</div></div>
+    <div class="fresh" id="fresh">…</div></header>
+  <div class="filters">
+    <label class="muted" for="pick">Store</label><select id="pick"><option value="">All stores</option></select>
+    <div class="seg" id="ranges"><button data-r="today" class="on">Today</button><button data-r="7d">7 days</button><button data-r="30d">30 days</button></div>
+  </div>
+  <div class="tiles">
+    <div class="card" id="t-n"><div class="k">Orders</div><div class="v" id="n">–</div><div class="sub" id="n-sub"></div></div>
+    <div class="card" id="t-r"><div class="k">Revenue</div><div class="v" id="r">–</div><div class="sub" id="r-sub"></div></div>
+    <div class="card" id="t-c"><div class="k">Cancelled</div><div class="v" id="c">–</div><div class="sub" id="c-sub"></div></div>
+    <div class="card"><div class="k">Last change seen</div><div class="v" id="chg" style="font-size:18px">–</div><div class="sub" id="chg-t"></div></div>
+  </div>
+  <div class="grid2">
+    <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <h2 style="margin:0" id="trend-title">Orders per hour</h2>
+        <div class="seg"><button id="g-hour" class="on" onclick="setGran('hour')">48 hours</button><button id="g-day" onclick="setGran('day')">30 days</button></div></div>
+      <div id="chart"></div><div class="muted" id="trend-note"></div></div>
+    <div class="card" id="t-status"><h2>Orders by status</h2><table id="status"></table></div>
+  </div>
+  <div class="grid2">
+    <div class="card" id="t-stores"><h2>Stores by revenue</h2><div class="muted" style="margin-bottom:6px">Each store is its own database · click a store to focus on it</div>
+      <div class="scroll"><table id="bystore"></table></div></div>
+    <div class="card" id="t-top"><h2>Top 10 products by sales</h2><table id="top"></table>
+      <div class="muted" style="margin-top:6px">Across the selected stores · sales exclude cancelled and returned orders</div></div>
+  </div>`;
+  $('pick').innerHTML = '<option value="">All stores</option>' + stores.map(s => `<option value="${s.tenant_id}">${s.tenant_id} · ${s.name} (${s.tier}) · ${s.database}</option>`).join('');
+  $('pick').onchange = () => { pick = $('pick').value; prev = {}; tick(); };
+  $('ranges').querySelectorAll('button').forEach(b => b.onclick = () => {
+    range = b.dataset.r; $('ranges').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); prev = {}; tick(); });
+}
+function setGran(g) { gran = g; $('g-hour').classList.toggle('on', g === 'hour'); $('g-day').classList.toggle('on', g === 'day'); tick(); }
+function focusStore(tid) { pick = String(tid); $('pick').value = pick; prev = {}; tick(); }
+
+async function get(path, q) {
+  const u = new URL(path, location.origin);
+  for (const [k, v] of Object.entries(q)) if (v != null && v !== '') u.searchParams.set(k, v);
+  const r = await fetch(u, { headers: { 'X-API-Key': key } });
+  const body = await r.json();
+  if (!r.ok) throw Object.assign(new Error(body.detail || r.status), { status: r.status });
+  return body;
+}
+function flash(id, changed) { if (!changed) return; const el = $(id); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 60); }
+
+function drawChart(buckets) {
+  const W = $('chart').clientWidth || 600, H = 200, padL = 48, padB = 22, padT = 8;
+  const max = Math.max(1, ...buckets.map(b => b.count));
+  const nice = Math.pow(10, Math.floor(Math.log10(max))); const top = Math.ceil(max / nice) * nice;
+  const n = Math.max(1, buckets.length), slot = (W - padL) / n, bw = Math.max(1, slot - 2);
+  const y = v => padT + (H - padT - padB) * (1 - v / top);
+  let svg = `<svg width="${W}" height="${H}" role="img" aria-label="Orders per ${gran}">`;
+  for (let i = 0; i <= 4; i++) { const v = top * i / 4, yy = y(v);
+    svg += `<line x1="${padL}" x2="${W}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/><text x="${padL - 6}" y="${yy + 4}" text-anchor="end">${num(Math.round(v))}</text>`; }
+  buckets.forEach((b, i) => {
+    const x = padL + i * slot + 1, y0 = y(0), y1 = y(b.count), h = y0 - y1, r = Math.min(4, bw / 2, h);
+    if (h > 0) svg += `<path d="M${x},${y0} V${y1 + r} Q${x},${y1} ${x + r},${y1} H${x + bw - r} Q${x + bw},${y1} ${x + bw},${y1 + r} V${y0} Z" fill="var(--bar)"/>`;
+    svg += `<rect x="${x - 1}" y="${padT}" width="${slot}" height="${H - padT - padB}" fill="transparent" data-i="${i}"/>`;
+  });
+  const every = Math.ceil(n / 8);
+  buckets.forEach((b, i) => { if (i % every === 0) {
+    const d = new Date(b.bucket), lab = gran === 'hour' ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+    svg += `<text x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${lab}</text>`; } });
+  svg += `</svg><div class="tip" id="tip"></div>`;
+  $('chart').innerHTML = svg;
+  $('chart').querySelectorAll('rect[data-i]').forEach(r => {
+    r.onmousemove = e => { const b = buckets[r.dataset.i], d = new Date(b.bucket), tip = $('tip');
+      tip.innerHTML = `${gran === 'hour' ? d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' (UTC day)'}<br><b>${num(b.count)} orders</b> · ${rupees(b.revenue_cents)}`;
+      const box = $('chart').getBoundingClientRect(); tip.style.left = (e.clientX - box.left) + 'px'; tip.style.top = (e.clientY - box.top) + 'px'; tip.style.display = 'block'; };
+    r.onmouseleave = () => { $('tip').style.display = 'none'; };
+  });
+}
+
+function rangeStart(now) {
+  if (range === 'today') { const m = new Date(now); m.setHours(0, 0, 0, 0); return m; }
+  return new Date(now - (range === '7d' ? 7 : 30) * 864e5);
+}
+
+async function tick() {
+  const now = new Date(), from = rangeStart(now).toISOString();
+  const s = pick || null;
+  const tFrom = gran === 'hour' ? new Date(Math.floor((now - 47 * 36e5) / 36e5) * 36e5) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29));
+  const tTo = gran === 'hour' ? new Date(Math.ceil((+now + 1) / 36e5) * 36e5) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  try {
+    const [cnt, st, tr, bs, top] = await Promise.all([
+      get('/owner/orders/count', { from, stores: s }),
+      get('/owner/orders/by-status', { from, stores: s }),
+      get('/owner/orders/trend', { from: tFrom.toISOString(), to: tTo.toISOString(), granularity: gran, stores: s }),
+      get('/owner/orders/by-store', { from }),
+      get('/owner/products/top', { from, n: 10, stores: s }),
+    ]);
+    const label = { today: 'today', '7d': 'last 7 days', '30d': 'last 30 days' }[range];
+    const scope = pick ? `store ${pick}` : `${cnt.stores} stores`;
+    const c = st.by_status.cancelled;
+    $('subtitle').textContent = `Live from ZETA · ${scope} · aggregated across store databases`;
+    $('n').textContent = num(cnt.count); $('n-sub').textContent = `${label} · ${scope}`;
+    $('r').textContent = rupees(cnt.revenue_cents); $('r-sub').textContent = `all statuses · ${label}`;
+    $('c').textContent = num(c.count); $('c-sub').textContent = rupees(c.revenue_cents);
+    const maxS = Math.max(1, ...STATUSES.map(x => st.by_status[x].count));
+    $('status').innerHTML = `<tr><th>status</th><th class="barcell"></th><th>orders</th><th>value</th></tr>` + STATUSES.map(x =>
+      `<tr><td>${x}</td><td class="barcell"><div class="hbar" style="width:${100 * st.by_status[x].count / maxS}%"></div></td><td>${num(st.by_status[x].count)}</td><td>${rupees(st.by_status[x].revenue_cents)}</td></tr>`).join('');
+    const maxB = Math.max(1, ...bs.by_store.map(x => x.revenue_cents));
+    $('bystore').innerHTML = `<tr><th>store</th><th>database</th><th class="barcell"></th><th>orders</th><th>revenue</th></tr>` + bs.by_store.map(x =>
+      `<tr class="click" onclick="focusStore(${x.tenant_id})"${String(x.tenant_id) === pick ? ' style="font-weight:600"' : ''}><td>${x.tenant_id} · ${x.name}</td><td class="muted">${x.database}</td>
+       <td class="barcell"><div class="hbar" style="width:${100 * x.revenue_cents / maxB}%"></div></td><td>${num(x.count)}</td><td>${rupees(x.revenue_cents)}</td></tr>`).join('');
+    const maxP = Math.max(1, ...top.products.map(p => p.sales_cents));
+    $('top').innerHTML = `<tr><th>#</th><th>product</th><th>store</th><th class="barcell"></th><th>sales</th></tr>` + (top.products.map((p, i) =>
+      `<tr><td>${i + 1}</td><td style="text-align:left">${p.name}</td><td>${p.tenant_id}</td><td class="barcell"><div class="hbar" style="width:${100 * p.sales_cents / maxP}%"></div></td><td>${rupees(p.sales_cents)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">No sales yet</td></tr>');
+    $('trend-title').textContent = gran === 'hour' ? 'Orders per hour' : 'Orders per day';
+    $('trend-note').textContent = (gran === 'hour' ? 'Last 48 hours, local time' : 'Last 30 days (UTC days)') + ` · ${scope} · hover a bar for details`;
+    drawChart(tr.buckets);
+
+    const sig = { n: cnt.count + ':' + cnt.revenue_cents, c: c.count, status: JSON.stringify(st.by_status),
+                  stores: JSON.stringify(bs.by_store.map(x => [x.tenant_id, x.count, x.revenue_cents])), top: JSON.stringify(top.products) };
+    if (prev.n) {
+      flash('t-n', sig.n !== prev.n); flash('t-r', sig.n !== prev.n); flash('t-c', sig.c !== prev.c);
+      flash('t-status', sig.status !== prev.status); flash('t-stores', sig.stores !== prev.stores); flash('t-top', sig.top !== prev.top);
+      if (sig.n !== prev.n || sig.c !== prev.c) {
+        const dn = cnt.count - prev.count, dc = c.count - prev.cancelled;
+        lastChange = { at: Date.now(), text: dc > 0 ? `${dc} cancelled` : dn > 0 ? `+${dn} new order${dn > 1 ? 's' : ''}` : dn < 0 ? `${dn} orders` : 'orders updated' };
+      }
+    }
+    Object.assign(prev, sig, { count: cnt.count, cancelled: c.count });
+    if (lastChange) { $('chg').textContent = lastChange.text; $('chg-t').textContent = ((Date.now() - lastChange.at) / 1000).toFixed(0) + ' s ago'; }
+    const f = cnt.freshness || {};
+    $('fresh').innerHTML = `${f.databases ?? '–'} store databases · max ZETA lag ${f.max_cdc_lag_ms == null ? '–' : Math.round(f.max_cdc_lag_ms) + ' ms'}<br>` +
+      `last DB change ${f.updated_s_ago == null ? '–' : f.updated_s_ago + ' s ago'} · query ${cnt.took_ms} ms`;
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) { loginForm('That key was not accepted: ' + e.message); return; }
+    $('fresh').innerHTML = `<span class="err">${e.status === 429 ? 'Slowing down: rate limit reached' : 'Cannot reach ZETA: ' + e.message}</span>`;
+  }
+}
+
+async function start() {
+  clearInterval(timer);
+  if (!key || !key.startsWith('zo_') && !key.startsWith('za_')) { loginForm(key ? 'That is not an owner key (zo_…)' : ''); return; }
+  store.set('zeta-owner-key', key);
+  if (params.get('key')) history.replaceState(null, '', '/dashboard');
+  try { stores = await get('/owner/stores', {}); } catch (e) { loginForm('That key was not accepted: ' + e.message); return; }
+  shell(); prev = {}; tick(); timer = setInterval(tick, 2000);
+}
+start();
+</script>
+</body>
+</html>

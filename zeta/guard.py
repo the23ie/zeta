@@ -16,10 +16,13 @@ import sys
 import threading
 import time
 
-SECRET = os.environ.get("ZETA_SECRET", "zeta-dev-secret").encode()
+_SECRET_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".zeta_secret")
+# ZETA_SECRET, else the project's .zeta_secret file, else a dev default (anyone with the code can mint keys)
+SECRET = (os.environ.get("ZETA_SECRET")
+          or (open(_SECRET_FILE).read().strip() if os.path.exists(_SECRET_FILE) else "zeta-dev-secret")).encode()
 AUTH = os.environ.get("ZETA_AUTH", "1") == "1"
 LIMITS = os.environ.get("ZETA_LIMITS", "1") == "1"
-TIER_CAPACITY = {"enterprise": 20000, "growth": 8000, "starter": 4000}  # cost units; refill = capacity / 2 per s
+TIER_CAPACITY = {"enterprise": 20000, "growth": 8000, "starter": 4000, "owner": 200000}  # cost units; refill = capacity / 2 per s
 
 
 def _mac(msg, n):
@@ -34,12 +37,19 @@ def admin_key():
     return f"za_{_mac('admin', 32)}"
 
 
+def owner_key():
+    """The company that owns every store: reads any store and the cross-store /owner routes."""
+    return f"zo_{_mac('owner', 32)}"
+
+
 def check_key(key, tid=None):
     """Returns 'admin', the tenant id the key is bound to, or None."""
     if not key:
         return None
     if hmac.compare_digest(key, admin_key()):
         return "admin"
+    if hmac.compare_digest(key, owner_key()):
+        return "owner"
     parts = key.split("_")
     if len(parts) == 3 and parts[0] == "zt" and parts[1].isdigit():
         k_tid = int(parts[1])
@@ -82,4 +92,5 @@ class Limiter:
 if __name__ == "__main__":
     for a in sys.argv[1:]:
         print(f"tenant {a}: {tenant_key(int(a))}")
+    print(f"owner:    {owner_key()}")
     print(f"admin:    {admin_key()}")

@@ -26,22 +26,24 @@ US = "('epoch'::timestamptz + %s * interval '1 microsecond')"
 
 
 class Auditor:
-    def __init__(self, engine, dsn, interval=60.0):
-        self.engine, self.dsn, self.interval = engine, dsn, interval
+    def __init__(self, engine, hub, interval=60.0):
+        self.engine, self.hub, self.interval = engine, hub, interval
         self.lock = threading.Lock()
         self.last = None
         self.history = []
 
     # ---------- helpers ----------
-    def _wait_caught_up(self):
+    @staticmethod
+    def _wait_caught_up(stream):
+        """Write a marker into this store database's WAL; wait until its stream has applied it."""
         token = "audit-" + uuid.uuid4().hex
-        c = psycopg2.connect(self.dsn)
+        c = psycopg2.connect(stream.dsn)
         c.autocommit = True
         with c.cursor() as cur:
             cur.execute("SELECT pg_logical_emit_message(true, 'zeta', %s)", (token,))
         c.close()
         t0 = time.time()
-        while self.engine.stats["last_marker"] != token:
+        while token not in stream.markers:
             if time.time() - t0 > 30:
                 raise TimeoutError("ZETA did not catch up within 30s")
             time.sleep(0.002)
@@ -71,9 +73,32 @@ class Auditor:
             return self._run(localize, repair)
 
     def _run(self, localize, repair):
-        eng = self.engine
         t0 = time.time()
-        conn = psycopg2.connect(self.dsn)
+        with self.hub.lock:
+            streams = list(self.hub.streams.values())
+        res = {"at": time.time(), "databases": len(streams), "tenants": {}, "localized": [],
+               "sql_ms": 0.0, "invisible_txns": 0, "snapshots": {}}
+        for st in streams:  # one snapshot-exact comparison per store database
+            r = self._audit_db(st, localize, repair)
+            res["tenants"].update(r["tenants"])
+            res["localized"] += r["localized"]
+            res["sql_ms"] += r["sql_ms"]
+            res["invisible_txns"] += r["invisible_txns"]
+            res["snapshots"][st.db] = r["snapshot"]
+        res["sql_ms"] = round(res["sql_ms"], 1)
+        res["snapshot"] = f"one per database ({len(streams)})"
+        res["ok"] = all(v["ok"] for v in res["tenants"].values()) or (
+            repair and bool(res["localized"]) and all(x.get("after_ok") for x in res["localized"]))
+        res["took_ms"] = round((time.time() - t0) * 1000, 1)
+        self.last = res
+        self.history = (self.history + [{k: res[k] for k in ("at", "ok", "took_ms", "sql_ms")}])[-50:]
+        log.info("audit ok=%s databases=%d stores=%d took=%.0fms localized=%s", res["ok"], len(streams),
+                 len(res["tenants"]), res["took_ms"], res["localized"])
+        return res
+
+    def _audit_db(self, st, localize, repair):
+        eng = self.engine
+        conn = psycopg2.connect(st.dsn)
         conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
         cur = conn.cursor()
         try:
@@ -84,15 +109,16 @@ class Auditor:
             cur.execute(f"SELECT tenant_id, {AGG} FROM orders GROUP BY 1")
             db = {tid: [int(c), int(r), int(h)] for tid, c, r, h in cur.fetchall()}
             sql_ms = (time.time() - ts) * 1000
-            self._wait_caught_up()
+            self._wait_caught_up(st)
 
+            # xids are cluster-wide, so the snapshot of this database also classifies every logged delta
             xmax32, xip32 = xmax & 0xFFFFFFFF, {x & 0xFFFFFFFF for x in xip}
-            res = {"at": time.time(), "snapshot": f"{xmin}:{xmax}:{','.join(map(str, xip))}",
-                   "sql_ms": round(sql_ms, 1), "tenants": {}, "localized": []}
+            out = {"snapshot": f"{xmin}:{xmax}:{','.join(map(str, xip))}", "sql_ms": sql_ms,
+                   "tenants": {}, "localized": []}
             with eng.lock:
                 invisible = [e for xid, e in eng.recent if xid is None or xid >= xmax32 or xid in xip32]
-                res["invisible_txns"] = len(invisible)
-                for tid in sorted(set(db) | set(eng.tenants)):
+                out["invisible_txns"] = len(invisible)
+                for tid in sorted(set(db) | set(st.tids)):
                     t = eng.tenants.get(tid)
                     if t is None:
                         z = [0, 0, 0]
@@ -100,23 +126,15 @@ class Auditor:
                         a, o = t.audit_range(0, t.T), t.audit_outside()
                         z = self._minus([a[0] + o[0], a[1] + o[1], (a[2] + o[2]) % P61], self._adjust(invisible, tid))
                     d = db.get(tid, [0, 0, 0])
-                    res["tenants"][tid] = {"ok": z == d, "db": d, "zeta": z}
-                bad = [tid for tid, v in res["tenants"].items() if not v["ok"]]
+                    out["tenants"][tid] = {"ok": z == d, "db": d, "zeta": z, "database": st.db}
                 if localize:
-                    for tid in bad:
-                        if tid in eng.tenants:
-                            res["localized"].append(self._localize(cur, eng.tenants[tid], invisible, repair))
-            res["ok"] = all(v["ok"] for v in res["tenants"].values()) or (
-                repair and bool(res["localized"]) and all(x.get("after_ok") for x in res["localized"]))
-            res["took_ms"] = round((time.time() - t0) * 1000, 1)
+                    for tid, v in out["tenants"].items():
+                        if not v["ok"] and tid in eng.tenants:
+                            out["localized"].append(self._localize(cur, eng.tenants[tid], invisible, repair))
+            return out
         finally:
             conn.rollback()
             conn.close()
-        self.last = res
-        self.history = (self.history + [{k: res[k] for k in ("at", "ok", "took_ms", "sql_ms")}])[-50:]
-        log.info("audit ok=%s tenants=%d took=%.0fms localized=%s", res["ok"], len(res["tenants"]),
-                 res["took_ms"], res["localized"])
-        return res
 
     def _localize(self, cur, t, invisible, repair):
         """Binary search over hour buckets, every comparison at the audit snapshot."""

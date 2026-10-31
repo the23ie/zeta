@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo Store</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#e3e3de;
+          --accent:#2f6f4f; --accent-ink:#fff; --soft:#e7f1ec; --bad:#c23b3b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141413; --card:#1e1e1c; --ink:#ececea; --muted:#9a9a94; --line:#33332f;
+            --accent:#5fbf8c; --accent-ink:#0c1a12; --soft:#1d2e25; --bad:#ff7b7b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:18px 16px 60px; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:15px; margin:0 0 10px; }
+  .muted { color:var(--muted); font-size:13px; }
+  select, button { font:inherit; }
+  select { padding:6px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  button { background:var(--accent); color:var(--accent-ink); border:0; border-radius:8px; padding:7px 12px; cursor:pointer; font-weight:600; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); font-weight:500; }
+  button.danger { background:transparent; color:var(--bad); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:default; }
+  .layout { display:grid; grid-template-columns: 1fr 320px; gap:14px; align-items:start; }
+  @media (max-width:820px) { .layout { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr)); gap:10px; }
+  .prod { border:1px solid var(--line); border-radius:10px; padding:10px; display:flex; flex-direction:column; gap:6px; }
+  .prod .name { font-weight:600; } .price { font-variant-numeric:tabular-nums; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .cart-line, .order { border-bottom:1px solid var(--line); padding:8px 0; }
+  .total { font-weight:700; font-size:17px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; font-weight:600; border:1px solid var(--line); }
+  .pill.cancelled { color:var(--bad); }
+  .toast { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); background:var(--ink); color:var(--bg);
+           padding:10px 14px; border-radius:10px; font-size:14px; opacity:0; transition:opacity .2s; max-width:calc(100% - 32px); }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Demo Store</h1>
+      <div class="muted">Customer view · orders go to the shop's Postgres database, ZETA picks them up from the change stream</div>
+    </div>
+    <div class="row">
+      <label class="muted" for="shop">Shop</label>
+      <select id="shop"></select>
+    </div>
+  </header>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="row">
+      <div>Shopping as <b id="cust">…</b> <span class="muted" id="custcity"></span></div>
+      <button class="ghost" onclick="newCustomer()">Switch customer</button>
+    </div>
+  </div>
+
+  <div class="layout">
+    <section class="card">
+      <div class="row" style="margin-bottom:10px"><h2>Products</h2><button class="ghost" onclick="loadCatalog()">Show other products</button></div>
+      <div class="grid" id="catalog"></div>
+    </section>
+    <aside>
+      <section class="card" style="margin-bottom:14px">
+        <h2>Cart</h2>
+        <div id="cart"><div class="muted">Empty</div></div>
+        <div class="row" style="margin-top:10px">
+          <span class="total" id="carttotal">₹0.00</span>
+          <button id="place" onclick="placeOrder()" disabled>Place order</button>
+        </div>
+      </section>
+      <section class="card">
+        <h2>My orders</h2>
+        <div id="orders"><div class="muted">None yet</div></div>
+      </section>
+    </aside>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+const rupees = c => '₹' + (c / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+let shop = Number(new URLSearchParams(location.search).get('shop')) || store.get('shop', 7);
+let customer = null, catalog = [], cart = {};
+
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 3500); }
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.detail || r.status);
+  return body;
+}
+
+async function init() {
+  const shops = await api('/api/shops');
+  $('shop').innerHTML = shops.map(s => `<option value="${s.tenant_id}">${s.tenant_id} · ${s.name} (${s.tier}) · db ${s.database}</option>`).join('');
+  $('shop').value = shop;
+  $('shop').onchange = () => { shop = Number($('shop').value); store.set('shop', shop); cart = {}; customer = null; start(); };
+  start();
+}
+async function start() {
+  history.replaceState(null, '', '?shop=' + shop);
+  customer = store.get('customer-' + shop, null);
+  if (!customer) await newCustomer(); else showCustomer();
+  await loadCatalog(); renderCart(); refreshOrders();
+}
+async function newCustomer() {
+  customer = await api(`/api/shops/${shop}/customer`);
+  store.set('customer-' + shop, customer); showCustomer();
+}
+function showCustomer() { $('cust').textContent = customer.name; $('custcity').textContent = '· ' + customer.city + ' · customer #' + customer.customer_id; }
+async function loadCatalog() {
+  catalog = await api(`/api/shops/${shop}/catalog?n=12`);
+  $('catalog').innerHTML = catalog.map(p => `
+    <div class="prod">
+      <div class="name">${p.name}</div>
+      <div class="muted">${p.category} · #${p.product_id}</div>
+      <div class="row"><span class="price">${rupees(p.price_cents)}</span><button onclick="add(${p.product_id})">Add</button></div>
+    </div>`).join('');
+}
+function add(pid) {
+  const p = catalog.find(x => x.product_id === pid) || cart[pid]?.p;
+  cart[pid] = { p, qty: (cart[pid]?.qty || 0) + 1 }; renderCart();
+}
+function dec(pid) { if (!cart[pid]) return; if (--cart[pid].qty <= 0) delete cart[pid]; renderCart(); }
+function renderCart() {
+  const lines = Object.values(cart);
+  $('cart').innerHTML = lines.length ? lines.map(({ p, qty }) => `
+    <div class="cart-line row"><span>${qty} × ${p.name}</span>
+      <span class="row"><span class="price">${rupees(p.price_cents * qty)}</span><button class="ghost" onclick="dec(${p.product_id})">−</button></span></div>`).join('')
+    : '<div class="muted">Empty</div>';
+  $('carttotal').textContent = rupees(lines.reduce((s, { p, qty }) => s + p.price_cents * qty, 0));
+  $('place').disabled = !lines.length;
+}
+async function placeOrder() {
+  $('place').disabled = true;
+  try {
+    const items = Object.values(cart).map(({ p, qty }) => ({ product_id: p.product_id, qty }));
+    const o = await api(`/api/shops/${shop}/orders`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customer_id: customer.customer_id, items }) });
+    const mine = store.get('orders-' + shop, []); mine.unshift(o.order_id); store.set('orders-' + shop, mine.slice(0, 20));
+    cart = {}; renderCart();
+    toast(`Order #${o.order_id} placed · ${rupees(o.total_cents)} · committed ${new Date(o.created_at).toLocaleTimeString()}`);
+    refreshOrders();
+  } catch (e) { toast('Could not place order: ' + e.message); renderCart(); }
+}
+async function cancelOrder(oid) {
+  try {
+    const r = await api(`/api/shops/${shop}/orders/${oid}/cancel`, { method: 'POST' });
+    toast(`Order #${oid} cancelled · ${new Date(r.cancelled_at).toLocaleTimeString()}`);
+  } catch (e) { toast('Could not cancel: ' + e.message); }
+  refreshOrders();
+}
+async function refreshOrders() {
+  const ids = store.get('orders-' + shop, []);
+  if (!ids.length) { $('orders').innerHTML = '<div class="muted">None yet</div>'; return; }
+  const orders = await api(`/api/shops/${shop}/orders?ids=` + ids.join(','));
+  $('orders').innerHTML = orders.map(o => `
+    <div class="order">
+      <div class="row"><b>#${o.order_id}</b><span class="pill ${o.status}">${o.status}</span></div>
+      <div class="muted">${o.items.map(i => i.qty + ' × ' + i.name).join(', ')}</div>
+      <div class="row"><span class="price">${rupees(o.total_cents)}</span>
+        ${['placed', 'shipped'].includes(o.status) ? `<button class="danger" onclick="cancelOrder(${o.order_id})">Cancel</button>` : ''}</div>
+    </div>`).join('');
+}
+init().catch(e => toast('Store unavailable: ' + e.message));
+</script>
+</body>
+</html>

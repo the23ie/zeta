@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Live judge demo: one tenant's customers place orders, then cancel some.
+"""Live judge demo: one store's customers place orders, then cancel some.
 
-For every step it shows
-  * the write going into Postgres (the store app's normal INSERT / UPDATE),
+Every store has its own Postgres database. For every step it shows
+  * the write going into that store's database (the store app's normal INSERT / UPDATE),
   * how long until ZETA's API reflects it (commit -> visible, measured end to end over HTTP),
-  * the dashboard numbers (count, by-status, top products) before and after,
-  * the same numbers from a direct SQL query, to prove they match,
-  * another tenant's numbers, to prove nothing leaked across tenants.
+  * the store's numbers (count, by-status, top products) before and after, vs direct SQL in its database,
+  * the owner's numbers across ALL store databases, vs SQL run in every store database,
+  * another store's numbers, to prove nothing leaked across stores.
 
-  python demo_live.py                         # tenant 5 on the 10M server
+  python demo_live.py                         # store 5 on the 10M server (100 store databases)
   python demo_live.py --tenant 1 --orders 3 --cancel 2
-  python demo_live.py --api http://localhost:8000 --db zeta
+  python demo_live.py --api http://localhost:8000
 """
 import argparse
 import random
@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import psycopg2
 
-from zeta.guard import tenant_key
+from zeta.guard import owner_key, tenant_key
 
 UTC = timezone.utc
 
@@ -34,8 +34,13 @@ class Demo:
         self.a = a
         self.tid = a.tenant
         self.other = a.other
-        self.db = psycopg2.connect(f"host=localhost port=5433 user=zeta dbname={a.db}")
         self.api = httpx.Client(base_url=a.api, timeout=10)
+        self.stores = {s["tenant_id"]: s["database"] for s in
+                       self.api.get("/owner/stores", headers={"X-API-Key": owner_key()}).json()}
+        self.dbname = self.stores[self.tid]
+        self.db = psycopg2.connect(f"host=localhost port=5433 user=zeta dbname={self.dbname}")
+        self.all_dbs = [psycopg2.connect(f"host=localhost port=5433 user=zeta dbname={d}")
+                        for d in sorted(set(self.stores.values()))]
         self.hdr = {"X-API-Key": tenant_key(self.tid)}
         now = datetime.now(UTC)
         day = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -54,6 +59,31 @@ class Demo:
                 "status": {k: v["count"] for k, v in s["by_status"].items()},
                 "top": [(p["product_id"], p["sales_cents"]) for p in t["products"]],
                 "lag": c["freshness"]["cdc_lag_ms"]}
+
+    def owner(self):
+        h = {"X-API-Key": owner_key()}
+        c = self.api.get("/owner/orders/count", params=self.win, headers=h).json()
+        return c["count"], c["revenue_cents"], c["stores"]
+
+    def owner_sql(self):
+        """What the owner would have to do without ZETA: query every store database and add up."""
+        cnt = rev = 0
+        for conn in self.all_dbs:
+            with conn.cursor() as c:
+                c.execute("SELECT count(*), coalesce(sum(total_cents),0) FROM orders "
+                          "WHERE created_at >= %s AND created_at < %s", (self.win["from"], self.win["to"]))
+                n, r = c.fetchone()
+            conn.rollback()
+            cnt, rev = cnt + int(n), rev + int(r)
+        return cnt, rev
+
+    def show_owner(self):
+        n, r, stores = self.owner()
+        qn, qr = self.owner_sql()
+        ok = (n, r) == (qn, qr)
+        print(f"     OWNER today, all {stores} store databases: {n:,} orders, {rupees(r)}  "
+              f"(SQL across {len(self.all_dbs)} databases: {qn:,}, {rupees(qr)} -> {'MATCHES' if ok else 'MISMATCH!'})")
+        return ok
 
     def sql(self):
         with self.db.cursor() as c:
@@ -131,12 +161,14 @@ class Demo:
     # ---------- the story ----------
     def run(self):
         a = self.a
-        print(f"\nZETA live demo · tenant {self.tid} · API {a.api} · Postgres db '{a.db}' · window = today (UTC)\n")
+        print(f"\nZETA live demo · store {self.tid} (database '{self.dbname}') · API {a.api} · "
+              f"window = today (UTC)\n")
         z0 = self.zeta()
         other0 = self.zeta(self.other)
         print("0) Before")
         self.show(z0)
         ok = self.verify(z0)
+        ok &= self.show_owner()
         hot = [p for p, _ in z0["top"][:1]] or []
         with self.db.cursor() as c:
             c.execute("SELECT product_id FROM products WHERE tenant_id=%s ORDER BY random() LIMIT 2", (self.tid,))
@@ -155,6 +187,7 @@ class Demo:
             print(f"     visible in ZETA {ms:.1f} ms after COMMIT (CDC lag reported {z['lag']} ms)")
             self.show(z)
             ok &= self.verify(z)
+            ok &= self.show_owner()
             placed.append(oid)
 
         for j, oid in enumerate(placed[:a.cancel]):
@@ -166,6 +199,7 @@ class Demo:
                   f"its item sales retracted from top products (order count unchanged: a cancelled order is still an order)")
             self.show(z)
             ok &= self.verify(z)
+            ok &= self.show_owner()
 
         step = a.orders + a.cancel + 1
         print(f"\n{step}) Burst: a customer places an order and cancels it immediately (two transactions, back to back)")
@@ -195,6 +229,7 @@ class Demo:
             print(f"     back to the starting numbers {ms:.1f} ms after the last COMMIT")
             self.show(z)
             ok &= self.verify(z) and z["top"] == z0["top"] and z["revenue"] == z0["revenue"]
+            ok &= self.show_owner()
 
         lat = sorted(self.latencies)
         print(f"\nCommit -> visible in ZETA's API, {len(lat)} changes: min {lat[0]:.1f} ms, "
@@ -209,7 +244,6 @@ def main():
     ap.add_argument("--orders", type=int, default=3)
     ap.add_argument("--cancel", type=int, default=2)
     ap.add_argument("--api", default="http://localhost:8001")
-    ap.add_argument("--db", default="zeta10m")
     ap.add_argument("--keep", action="store_true", help="keep the demo orders (default: delete them at the end)")
     Demo(ap.parse_args()).run()
 
