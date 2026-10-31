@@ -55,6 +55,17 @@ Correctness:
 .venv/bin/python harness.py --dsn "host=localhost port=5433 user=zeta dbname=zeta10m" --api http://localhost:8001 --n 1000 --mutate 3000
 ```
 
+Live judge demo (one tenant's customers place orders, cancel some; latency + SQL match at every step):
+
+```bash
+.venv/bin/python demo_live.py                          # tenant 5 on the 10M server
+.venv/bin/python demo_live.py --tenant 1 --orders 3 --cancel 2
+```
+
+Sample run (10M): commit → visible in ZETA's API in 5.6–24.2 ms (median 16 ms) across 7 changes; count,
+revenue and top-3 products matched direct SQL after every step; a cancel retracted the product's sales to the
+exact previous value; tenant 2 unchanged and tenant 5's key rejected on tenant 2 (403); demo orders deleted at the end.
+
 Reset a database: stop its ZETA server, then `./load.sh data_1m zeta`.
 
 ## Checkpoint 1 — Sat 31 Oct, 5 pm (P0 done)
