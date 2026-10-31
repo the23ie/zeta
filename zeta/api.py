@@ -39,7 +39,7 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from . import guard
 from .audit import Auditor
@@ -85,7 +85,7 @@ async def timing(request: Request, call_next):
     t0 = time.perf_counter()
     resp = await call_next(request)
     route = request.scope.get("route")
-    if route is not None and route.path.startswith(("/tenants", "/owner")):
+    if route is not None and route.path.startswith(("/tenants", "/owner", "/analytics")):
         LAT[route.path].append(((time.perf_counter() - t0) * 1000, resp.status_code))
     return resp
 
@@ -139,8 +139,9 @@ def _key(request):
 
 
 def require_admin(request):
-    if guard.AUTH and guard.check_key(_key(request)) != "admin":
-        raise HTTPException(401, "admin key required")
+    """Operations (audit, repair, rebuild, monitor): the company owner or the admin."""
+    if guard.AUTH and guard.check_key(_key(request)) not in ("admin", "owner"):
+        raise HTTPException(401, "owner or admin key required")
 
 
 def admit(request, response, tid, kind, fu, tu, step=HOUR):
@@ -168,9 +169,20 @@ def _charge(response, bucket, tier, cost):
 
 
 def admit_owner(request, response, kind, fu, tu, stores, step=HOUR):
+    """Cross-store routes. Owner/admin: any stores. A store key: only its own store (FR-5)."""
     who = guard.check_key(_key(request)) if guard.AUTH else "admin"
+    if who is None:
+        raise HTTPException(401, "missing or invalid X-API-Key")
     if who not in ("admin", "owner"):
-        raise HTTPException(401 if who is None else 403, "owner key required")
+        if stores and {x.strip() for x in stores.split(",") if x.strip()} != {str(who)}:
+            raise HTTPException(403, "this key is only valid for its own store")
+        if who not in engine.tenants:
+            raise HTTPException(404, f"unknown tenant {who}")
+        cost = engine.tenants[who].cost(kind, fu, tu, step)
+        response.headers["X-ZETA-Cost"] = str(cost)
+        if guard.LIMITS:
+            _charge(response, who, engine.tiers.get(who), cost)
+        return [who]
     if stores:
         try:
             tids = sorted({int(x) for x in stores.split(",") if x.strip()})
@@ -353,6 +365,178 @@ def owner_top(request: Request, response: Response, from_: Optional[str] = Query
         for p, nm, s, tid in rows])
 
 
+# ---------------- analytics: what an owner dashboard needs beyond the four basics ----------------
+# Every number below is built from the same exact, invertible aggregates (counts and sums by store,
+# status, hour, product, category). Ratios (AOV, rates, growth) are derived from exact sums.
+
+METRICS = {
+    "orders": "orders created in the range (all statuses)",
+    "revenue": "sum of order totals, all statuses",
+    "net_sales": "order totals excluding cancelled and returned orders",
+    "aov": "average order value = revenue / orders",
+    "cancel_rate": "cancelled orders / orders",
+    "return_rate": "returned orders / orders",
+    "sales": "item sales (qty x price) excluding cancelled and returned orders; the only metric for category / product",
+}
+GROUPS = ["none", "store", "status", "category", "product", "day", "hour_of_day", "weekday"]
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+I_CANC, I_RET = S_IDX["cancelled"], S_IDX["returned"]
+
+
+def _metric(v, metric):
+    """v: [count|revenue, status] -> value of an order-level metric."""
+    n, rev = int(v[0].sum()), int(v[1].sum())
+    if metric == "orders":
+        return n
+    if metric == "revenue":
+        return rev
+    if metric == "net_sales":
+        return rev - int(v[1, I_CANC]) - int(v[1, I_RET])
+    if metric == "aov":
+        return round(rev / n) if n else 0
+    if metric == "cancel_rate":
+        return round(int(v[0, I_CANC]) / n, 4) if n else 0.0
+    if metric == "return_rate":
+        return round(int(v[0, I_RET]) / n, 4) if n else 0.0
+    raise HTTPException(400, f"metric must be one of {list(METRICS)}")
+
+
+def _kpis(v):
+    return {m: _metric(v, m) for m in ("orders", "revenue", "net_sales", "aov", "cancel_rate", "return_rate")}
+
+
+def _change(cur, prev):
+    return {k: (round((cur[k] - prev[k]) / prev[k] * 100, 1) if prev[k] else None) for k in cur}
+
+
+def _require_range(fu, tu):
+    if fu == MIN_US or tu == MAX_US:
+        raise HTTPException(400, "analytics routes need both from and to")
+
+
+@app.get("/analytics/summary")
+def analytics_summary(request: Request, response: Response, from_: Optional[str] = Query(None, alias="from"),
+                      to: Optional[str] = None, stores: Optional[str] = None):
+    """KPIs for the range and for the previous period of the same length, plus status and category mix."""
+    t0 = time.perf_counter()
+    fu, tu = parse_range(from_, to)
+    _require_range(fu, tu)
+    tids = admit_owner(request, response, "top", fu, tu, stores)
+    zero = np.zeros((2, len(STATUSES)), np.int64)
+    cur = sum(engine.owner_count(tids, fu, tu).values(), zero)
+    prev = sum(engine.owner_count(tids, 2 * fu - tu, fu).values(), zero)
+    k, kp = _kpis(cur), _kpis(prev)
+    return owner_envelope(tids, fu, tu, t0, kpis=k, previous=kp, change_pct=_change(k, kp),
+                          previous_period={"from": iso(2 * fu - tu), "to": iso(fu)},
+                          by_status={s: {"count": int(cur[0, i]), "revenue_cents": int(cur[1, i])}
+                                     for i, s in enumerate(STATUSES)},
+                          categories=engine.owner_categories(tids, fu, tu))
+
+
+@app.get("/analytics/stores")
+def analytics_stores(request: Request, response: Response, from_: Optional[str] = Query(None, alias="from"),
+                     to: Optional[str] = None, spark_days: int = Query(14, ge=2, le=60)):
+    """Store health: KPIs per store, growth vs the previous period, a daily sparkline, attention flags."""
+    t0 = time.perf_counter()
+    fu, tu = parse_range(from_, to)
+    _require_range(fu, tu)
+    tids = admit_owner(request, response, "count", fu, tu, None)
+    cur, prev = engine.owner_count(tids, fu, tu), engine.owner_count(tids, 2 * fu - tu, fu)
+    all_k = _kpis(sum(cur.values(), np.zeros((2, len(STATUSES)), np.int64)))
+    day0 = (tu - 1) // DAY * DAY - (spark_days - 1) * DAY
+    rows = []
+    for tid in tids:
+        k, kp = _kpis(cur[tid]), _kpis(prev[tid])
+        starts, vals = engine.trend(tid, day0, tu, DAY)
+        flags = []
+        growth = _change(k, kp)["orders"]
+        if growth is not None and growth <= -20 and kp["orders"] >= 20:
+            flags.append(f"orders down {abs(growth):.0f}% vs previous period")
+        if k["orders"] >= 20 and all_k["cancel_rate"] and k["cancel_rate"] >= 1.5 * all_k["cancel_rate"]:
+            flags.append(f"cancel rate {k['cancel_rate'] * 100:.1f}% vs {all_k['cancel_rate'] * 100:.1f}% overall")
+        rows.append({"tenant_id": tid, "name": engine.names.get(tid), "tier": engine.tiers.get(tid),
+                     "database": engine.stream_of[tid].db if tid in engine.stream_of else None,
+                     **k, "previous_orders": kp["orders"], "previous_revenue": kp["revenue"],
+                     "growth_pct": growth, "revenue_growth_pct": _change(k, kp)["revenue"],
+                     "spark": [int(v[0].sum()) for v in vals], "spark_start": iso(day0), "flags": flags})
+    rows.sort(key=lambda r: (-r["revenue"], r["tenant_id"]))
+    return owner_envelope(tids, fu, tu, t0, overall=all_k, stores_data=rows)
+
+
+@app.get("/analytics/explore")
+def analytics_explore(request: Request, response: Response, metric: str = "orders", by: str = "store",
+                      from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
+                      stores: Optional[str] = None, n: int = Query(20, ge=1, le=200)):
+    """Any metric by any dimension: a small semantic layer over the exact aggregates."""
+    t0 = time.perf_counter()
+    if metric not in METRICS:
+        raise HTTPException(400, f"metric must be one of {list(METRICS)}")
+    if by not in GROUPS:
+        raise HTTPException(400, f"by must be one of {GROUPS}")
+    if (by in ("category", "product")) != (metric == "sales") and not (metric == "sales" and by in ("store", "none")):
+        raise HTTPException(400, "category and product groupings use metric=sales; sales groups by none, store, category or product")
+    fu, tu = parse_range(from_, to)
+    _require_range(fu, tu)
+    tids = admit_owner(request, response, "top" if metric == "sales" else "trend", fu, tu, stores)
+    rows = []
+    if metric == "sales":
+        if by == "category":
+            rows = [{"key": c, "value": v} for c, v in engine.owner_categories(tids, fu, tu).items()]
+        elif by == "product":
+            rows = [{"key": f"{nm} (store {tid})", "product_id": p, "tenant_id": tid, "value": s}
+                    for p, nm, s, tid in engine.owner_top(tids, fu, tu, n)]
+        elif by == "store":
+            rows = [{"key": f"{tid} · {engine.names.get(tid)}", "tenant_id": tid, "value": v}
+                    for tid, v in engine.owner_sales_by_store(tids, fu, tu).items()]
+        else:
+            rows = [{"key": "all", "value": sum(engine.owner_sales_by_store(tids, fu, tu).values())}]
+    elif by in ("none", "store", "status"):
+        per = engine.owner_count(tids, fu, tu)
+        tot = sum(per.values(), np.zeros((2, len(STATUSES)), np.int64))
+        if by == "none":
+            rows = [{"key": "all", "value": _metric(tot, metric)}]
+        elif by == "store":
+            rows = [{"key": f"{tid} · {engine.names.get(tid)}", "tenant_id": tid, "value": _metric(v, metric)}
+                    for tid, v in per.items()]
+        else:
+            if metric not in ("orders", "revenue"):
+                raise HTTPException(400, "by=status supports metric orders or revenue")
+            rows = [{"key": st, "value": int(tot[0 if metric == "orders" else 1, i])} for i, st in enumerate(STATUSES)]
+    else:  # time dimensions, from exact hourly / daily buckets
+        step = DAY if by == "day" else HOUR
+        starts, vals = engine.owner_trend(tids, fu, tu, step)
+        if by == "day":
+            rows = [{"key": iso(int(s))[:10], "value": _metric(v, metric)} for s, v in zip(starts, vals)]
+        else:
+            nkeys = 24 if by == "hour_of_day" else 7
+            acc = np.zeros((nkeys, 2, len(STATUSES)), np.int64)
+            for s, v in zip(starts, vals):
+                d = datetime.fromtimestamp(int(s) / 1e6, timezone.utc)
+                acc[d.hour if by == "hour_of_day" else d.weekday()] += v
+            rows = [{"key": (f"{i:02d}:00 UTC" if by == "hour_of_day" else WEEKDAYS[i]), "value": _metric(acc[i], metric)}
+                    for i in range(nkeys)]
+    if by in ("store", "category", "product"):
+        rows.sort(key=lambda r: (-r["value"], r["key"]))
+        rows = rows[:n] if by != "product" else rows
+    return owner_envelope(tids, fu, tu, t0, metric=metric, by=by, definition=METRICS[metric], rows=rows)
+
+
+@app.get("/analytics/heatmap")
+def analytics_heatmap(request: Request, response: Response, from_: Optional[str] = Query(None, alias="from"),
+                      to: Optional[str] = None, stores: Optional[str] = None):
+    """Orders by weekday x hour of day (UTC): when do customers buy?"""
+    t0 = time.perf_counter()
+    fu, tu = parse_range(from_, to)
+    _require_range(fu, tu)
+    tids = admit_owner(request, response, "trend", fu, tu, stores)
+    starts, vals = engine.owner_trend(tids, fu, tu, HOUR)
+    grid = np.zeros((7, 24), np.int64)
+    for s, v in zip(starts, vals):
+        d = datetime.fromtimestamp(int(s) / 1e6, timezone.utc)
+        grid[d.weekday(), d.hour] += int(v[0].sum())
+    return owner_envelope(tids, fu, tu, t0, weekdays=WEEKDAYS, grid=grid.tolist(), timezone="UTC")
+
+
 # ---------------- health / admin / monitoring ----------------
 
 @app.get("/health")
@@ -445,7 +629,7 @@ def dashboard():
     return (Path(__file__).parent / "dashboard.html").read_text()
 
 
-@app.get("/monitor", response_class=HTMLResponse)
-def monitor(request: Request):
-    require_admin(request)
-    return (Path(__file__).parent / "monitor.html").read_text()
+@app.get("/monitor")
+def monitor():
+    """Operations now live in the one dashboard."""
+    return RedirectResponse("/dashboard#ops")

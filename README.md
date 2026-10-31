@@ -28,12 +28,12 @@ own queries and the owner's cross-store queries from memory, exactly.
 |---|---|
 | `split_load.py` | Loads the organisers' CSVs as **one Postgres database per store** (`t1m_001…t1m_010`, `t10m_001…t10m_100`) |
 | `zeta/cdc.py` | One `Stream` per store database (own replication slot, snapshot-exact bootstrap, freshness) and a `Hub` thread that follows all of them |
-| `zeta/engine.py` | Delta engine: per-store hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new); owner aggregation across stores |
-| `zeta/api.py` | FastAPI: store routes, owner routes, `/health`, `/markers`, admin/audit, `/monitor`, `/dashboard` |
+| `zeta/engine.py` | Delta engine: per-store hourly Fenwick (count/revenue × status), daily Fenwick of product-sales vectors, in-memory mirror for exact edges + join state, Z-set apply (−old, +new) |
+| `zeta/owner.py` | Owner index: all-store structures (hour × store × status Fenwick, day × every-product Fenwick, one time-sorted mirror of every store's rows) kept current by the same deltas, so owner queries cost about the same for 10 or 100 stores |
+| `zeta/api.py` | FastAPI: store routes, owner routes, analytics routes, `/health`, `/markers`, admin/audit, `/dashboard` |
 | `zeta/audit.py` | Snapshot-exact audit **per store database** (ledger hash + count + revenue), binary-search localization, surgical bucket rebuild |
 | `zeta/guard.py` | Keys: store key bound to one store (FR-5), owner key for all stores, admin key; cost-aware token buckets (B-3) |
-| `zeta/dashboard.html` | Owner dashboard (all stores, store filter, per-store breakdown, live) |
-| `zeta/monitor.html` | `/monitor` page (B-5): CDC lag, latency p50/p99, per-store audit grid, demo buttons |
+| `zeta/dashboard.html` | The one dashboard: Overview (KPIs vs previous period, trend, category mix, status, top products, weekday × hour heatmap), Stores (health table, growth, sparklines, attention flags), Explore (any metric by any dimension), Operations (B-5: CDC lag, latency, per-store audit grid, repair / rebuild) |
 | `store/` | Demo store app (customer side): pick a shop, place and cancel orders, written to that shop's database |
 | `harness.py` | Correctness: random store checks (SQL in that store's DB) and owner checks (SQL in every store DB, combined) |
 | `simulate.py` | Write traffic across the store databases (inserts, status changes, old cancellations, deletes, items, backdates) |
@@ -59,8 +59,8 @@ ZETA_HOST=0.0.0.0 ./run.sh t10m 8001   # 100 store databases (10M) on :8001, rea
 ./run_store.sh t10m               # optional: customer store app on :9000
 ```
 
-- Owner dashboard: `http://localhost:8001/dashboard?key=<owner key>`
-- Monitor: `http://localhost:8001/monitor?key=<admin key>`
+- Dashboard: `http://localhost:8001/dashboard?key=<owner key>`: the company owner sees every store plus the Operations tab;
+  a store key (`zt_…`) opens the same dashboard limited to that store (`/monitor` now redirects to the Operations tab)
 - Customer store: `http://localhost:9000/?shop=7`
 
 API (`from`/`to` ISO-8601, naive = UTC, range `[from, to)`, trend buckets UTC):
@@ -77,7 +77,15 @@ curl -H "X-API-Key: $O" "localhost:8001/owner/orders/by-store?from=2026-10-24"
 curl -H "X-API-Key: $O" "localhost:8001/owner/orders/by-status?from=2026-10-24&stores=1,2,3"
 curl -H "X-API-Key: $O" "localhost:8001/owner/orders/trend?from=2026-10-01&granularity=day"
 curl -H "X-API-Key: $O" "localhost:8001/owner/products/top?from=2026-10-24&n=10"
+curl -H "X-API-Key: $O" "localhost:8001/analytics/summary?from=2026-10-24&to=2026-10-31"            # KPIs + previous period + category mix
+curl -H "X-API-Key: $O" "localhost:8001/analytics/stores?from=2026-10-24&to=2026-10-31"             # store health
+curl -H "X-API-Key: $O" "localhost:8001/analytics/explore?metric=aov&by=weekday&from=2026-10-01&to=2026-10-31"
+curl -H "X-API-Key: $O" "localhost:8001/analytics/heatmap?from=2026-10-01&to=2026-10-31"
 ```
+
+Explore metrics: `orders, revenue, net_sales, aov, cancel_rate, return_rate, sales`; groupings: `none, store, status,
+category, product, day, hour_of_day, weekday` (category / product use `sales`). A store key may call the cross-store
+and analytics routes too, but only ever gets its own store.
 
 Correctness and demo:
 
@@ -96,8 +104,8 @@ Reload store databases: stop ZETA, then `.venv/bin/python split_load.py data_10m
 
 | Run | Checks | Match |
 |---|---|---|
-| 1M, 10 store DBs, after 2000 live writes | 1000 store + 200 owner | **1200/1200** |
-| 10M, 100 store DBs, after 2000 live writes across 49 DBs | 1000 store + 100 owner | **1100/1100** |
+| 1M, 10 store DBs, after 2000 live writes | 1000 store + 300 owner (incl. sales by category) | **1300/1300** |
+| 10M, 100 store DBs, after 2000 live writes | 1000 store + 150 owner (incl. sales by category) | **1150/1150** |
 | 10M, after rebuilding store 7's database during live writes | 400 store + 60 owner | **460/460** |
 
 - Audit runs per store database at that database's MVCC snapshot (100 snapshots, ~12 s per full sweep on 10M), green throughout
@@ -105,27 +113,29 @@ Reload store databases: stop ZETA, then `.venv/bin/python split_load.py data_10m
 - `POST /admin/rebuild?tenant=7` rebuilt only `t10m_007` in 1.2 s while the other 99 stores kept streaming
 - `demo_live.py` (store 5): each order / cancel visible in the store's numbers and in the owner's all-store total in 8–20 ms; both matched SQL (the owner total against SQL run in all 100 databases) at every step
 
-### Speed + Growth (`bench.py latency`)
+### Speed + Growth (`bench.py latency`, with the owner index)
 
 Store rows = the biggest store (374k orders at 1M, 2.3M at 10M). OWNER rows = all stores (10 databases at 1M, 100 at 10M).
 SQL for OWNER rows = the same question run in every store database and added up (what the owner does without ZETA).
 
 | Query | ZETA p50 1M | ZETA p50 10M | ZETA p99 10M | Growth | SQL p50 1M | SQL p50 10M |
 |---|---|---|---|---|---|---|
-| count 7d | 0.99 ms | 0.93 ms | 1.98 ms | 0.94× | 4.0 ms | 16.5 ms |
-| count 90d | 0.98 ms | 0.88 ms | 1.07 ms | 0.90× | 19.6 ms | 110 ms |
-| by-status 30d | 0.99 ms | 0.92 ms | 1.43 ms | 0.93× | 20.3 ms | 102 ms |
-| trend hour 3d | 1.56 ms | 1.50 ms | 2.18 ms | 0.96× | 4.2 ms | 28 ms |
-| trend day 90d | 1.96 ms | 2.19 ms | 3.19 ms | 1.11× | 111 ms | 605 ms |
-| top10 30d | 1.16 ms | 1.60 ms | 2.05 ms | 1.38× | 59 ms | 565 ms |
-| top10 90d | 1.13 ms | 1.88 ms | 3.41 ms | 1.65× | 88 ms | 729 ms |
-| OWNER count 7d | 1.15 ms | 3.27 ms | 3.87 ms | 2.84× | 121 ms | 570 ms |
-| OWNER by-store 30d | 1.30 ms | 4.52 ms | 5.04 ms | 3.49× | 130 ms | 1,320 ms |
-| OWNER trend day 90d | 2.53 ms | 10.2 ms | 16.0 ms | 4.05× | 317 ms | 5,425 ms |
-| OWNER top10 30d | 1.87 ms | 11.8 ms | 18.0 ms | 6.33× | 332 ms | 6,507 ms |
+| count 7d | 0.96 ms | 1.40 ms | 2.52 ms | 1.46× | 4.2 ms | 23.5 ms |
+| count 90d | 0.90 ms | 1.04 ms | 1.86 ms | 1.16× | 18.9 ms | 140 ms |
+| by-status 30d | 0.90 ms | 1.13 ms | 6.32 ms | 1.26× | 19.1 ms | 146 ms |
+| trend hour 3d | 1.44 ms | 1.75 ms | 3.06 ms | 1.22× | 4.1 ms | 39 ms |
+| trend day 90d | 1.62 ms | 1.93 ms | 4.15 ms | 1.19× | 101 ms | 596 ms |
+| top10 30d | 1.09 ms | 1.56 ms | 2.52 ms | 1.44× | 58 ms | 416 ms |
+| top10 90d | 1.10 ms | 1.57 ms | 2.65 ms | 1.43× | 139 ms | 722 ms |
+| OWNER count 7d | 1.38 ms | 1.69 ms | 2.48 ms | 1.22× | 91 ms | 768 ms |
+| OWNER by-store 30d | 1.19 ms | 2.91 ms | 6.46 ms | 2.44× | 101 ms | 1,164 ms |
+| OWNER trend day 90d | 1.71 ms | 2.03 ms | 2.30 ms | 1.19× | 289 ms | 3,215 ms |
+| OWNER top10 30d | 1.58 ms | 6.12 ms | 8.54 ms | 3.88× | 311 ms | 4,736 ms |
 
-Store queries: flat (≤ 1.65×). Owner queries: all far under 200 ms, but their cost grows with the **number of
-stores** (10 → 100), not with rows: each owner answer adds up every store's structures.
+Before the owner index, owner queries grew 2.8–6.3× (each answer added up every store's structures). Now:
+count and trend are flat; by-store returns 10× more rows (one per store); top-N stays exact by reading every item
+sold in the two partial days at the edges, so its edge cost follows orders per day (next step: hourly per-product
+subtotals).
 
 ### Freshness (`bench.py freshness`): order committed in `t10m_001` → visible in ZETA
 
@@ -166,6 +176,6 @@ Implementation notes vs the design doc:
 
 ## Still open
 
-- Owner queries cost grows with the number of stores (see Growth above); fix: a global time index over all stores
+- Owner top-N edge cost follows orders per day (3.9× from 1M to 10M, 6 ms); fix: hourly per-product subtotals
 - B-4 `metrics.yaml` validator (reject non-invertible aggregates)
 - One-command setup script / docker-compose for judges on a fresh machine

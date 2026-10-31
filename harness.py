@@ -140,7 +140,8 @@ def check_owner(rng, curs, lo, hi, api):
     tids = all_tids if rng.random() < 0.7 else sorted(rng.sample(all_tids, rng.randint(1, min(5, len(all_tids)))))
     hdr = {"X-API-Key": owner_key()}
     rkind, a, b = rand_range(rng, lo, hi)
-    q = rng.choice(["owner_count", "owner_by_store", "owner_by_status", "owner_trend_hour", "owner_trend_day", "owner_top"])
+    q = rng.choice(["owner_count", "owner_by_store", "owner_by_status", "owner_trend_hour", "owner_trend_day", "owner_top",
+                    "owner_category"])
     p = {"from": a.isoformat(), "to": b.isoformat()}
     if tids != all_tids:
         p["stores"] = ",".join(map(str, tids))
@@ -190,6 +191,20 @@ def check_owner(rng, curs, lo, hi, api):
         exp = sorted((k, v[0], v[1]) for k, v in acc.items())
         r, api_ms = timed(lambda: api.get("/owner/orders/trend", params=p, headers=hdr).json())
         got = [(x["bucket"], x["count"], x["revenue_cents"]) for x in r["buckets"] if x["count"]]
+    elif q == "owner_category":
+        per, sql_ms = timed(lambda: each(
+            "SELECT p.category, sum(i.qty::bigint * i.price_cents) FROM order_items i "
+            "JOIN orders o ON o.order_id = i.order_id JOIN products p ON p.product_id = i.product_id "
+            "WHERE o.tenant_id = %s AND o.created_at >= %s AND o.created_at < %s "
+            "AND o.status NOT IN ('cancelled','returned') GROUP BY 1"))
+        acc = defaultdict(int)
+        for rows in per.values():
+            for cat, v in rows:
+                acc[cat] += int(v)
+        exp = {k: v for k, v in acc.items() if v}
+        r, api_ms = timed(lambda: api.get("/analytics/explore", params={**p, "metric": "sales", "by": "category"},
+                                          headers=hdr).json())
+        got = {x["key"]: x["value"] for x in r["rows"]}
     else:
         n = rng.choice([1, 5, 10, 10, 50])
         p["n"] = n

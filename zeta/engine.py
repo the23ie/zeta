@@ -77,8 +77,24 @@ class Fenwick:
     def range(self, a, b):
         return self.prefix(b) - self.prefix(a)
 
+    def add_point(self, i, idx, delta):
+        """Add a scalar to one element (idx) of node vector i: O(log n), no full-width vector."""
+        i += 1
+        while i <= self.n:
+            self.tree[(i - 1,) + idx] += delta
+            i += i & -i
+
     def grow_cols(self, extra):
         self.tree = np.pad(self.tree, ((0, 0), (0, extra)))
+
+    def to_raw(self):
+        """Inverse of the build: recover the per-bucket array from the tree."""
+        r = self.tree.copy()
+        for i in range(self.n, 0, -1):
+            j = i + (i & -i)
+            if j <= self.n:
+                r[j - 1] -= r[i - 1]
+        return r
 
 
 def _ceil_div(a, b):
@@ -96,7 +112,10 @@ class Tenant:
         self.pid_arr = np.zeros(0, np.int64)
         self.pid_names = []
         self.pid_index = {}
+        self.pid_cat = np.zeros(0, np.int16)  # product category code (Engine.categories)
         self.day = Fenwick(np.zeros((self.D, 0), np.int64))
+        self.owner = None  # OwnerIndex this store reports its deltas to (zeta/owner.py)
+        self.g_sidx, self.g_index, self.g_pmap = None, None, None
         # base mirror (sorted by created_us); rows are never inserted, only flagged DELETED
         self.b_created = np.zeros(0, np.int64)
         self.b_oid = np.zeros(0, np.int64)
@@ -113,10 +132,11 @@ class Tenant:
         self.ov_keys = []   # sorted [(created_us, oid)]
 
     # ---------- products ----------
-    def set_products(self, pids, names):
+    def set_products(self, pids, names, cats=None):
         self.pid_arr = np.asarray(pids, np.int64)
         self.pid_names = list(names)
         self.pid_index = {int(p): i for i, p in enumerate(self.pid_arr)}
+        self.pid_cat = np.asarray(cats if cats is not None else [0] * len(self.pid_arr), np.int16)
 
     def pidx_of(self, pid, name=None):
         i = self.pid_index.get(pid)
@@ -125,7 +145,10 @@ class Tenant:
             self.pid_arr = np.append(self.pid_arr, np.int64(pid))
             self.pid_names.append(name or f"product_{pid}")
             self.pid_index[pid] = i
+            self.pid_cat = np.append(self.pid_cat, np.int16(0))
             self.day.grow_cols(1)
+            if self.owner is not None:
+                self.owner.add_product(self, i)
         elif name is not None:
             self.pid_names[i] = name
         return i
@@ -156,20 +179,30 @@ class Tenant:
         items = {int(l): (int(p), int(s)) for l, p, s in
                  zip(self.i_line[a:b], self.i_pidx[a:b], self.i_sales[a:b])}
         o = [int(self.b_created[pos]), int(self.b_status[pos]), int(self.b_total[pos]), items]
-        self.b_status[pos] = DELETED
-        oid = int(self.b_oid[pos])
-        self.ov[oid] = o
-        bisect.insort(self.ov_keys, (o[0], oid))
+        self.set_base(pos, status=DELETED)
+        self.ov_add(int(self.b_oid[pos]), o)
         return o
+
+    def set_base(self, pos, status=None, total=None):
+        if status is not None:
+            self.b_status[pos] = status
+        if total is not None:
+            self.b_total[pos] = total
+        if self.owner is not None:
+            self.owner.base_set(self, pos, status, total)
 
     def ov_add(self, oid, o):
         self.ov[oid] = o
         bisect.insort(self.ov_keys, (o[0], oid))
+        if self.owner is not None:
+            self.owner.ov_add(self, o[0], oid)
 
     def ov_remove(self, oid):
         o = self.ov.pop(oid)
         k = bisect.bisect_left(self.ov_keys, (o[0], oid))
         del self.ov_keys[k]
+        if self.owner is not None:
+            self.owner.ov_remove(self, o[0], oid)
         return o
 
     def _ov_range(self, a, b):
@@ -189,6 +222,8 @@ class Tenant:
             self.hb[h] = (int(self.hb[h]) + hv) % P61
 
     def hour_delta(self, created, status, total, sign):
+        if self.owner is not None:
+            self.owner.hour_delta(self, created, status, total, sign)
         h = (created - self.epoch) // HOUR
         if not 0 <= h < self.T:
             return  # outside the bucket axis: served from the mirror only
@@ -199,6 +234,8 @@ class Tenant:
         self.hour.add(h, v)
 
     def prod_delta(self, created, items, sign):
+        if self.owner is not None and items:
+            self.owner.prod_delta(self, created, items, sign)
         d = (created - self.epoch) // DAY
         if not items or not 0 <= d < self.D:
             return
@@ -367,11 +404,12 @@ class Tenant:
         b1 = _ceil_div(t2 - self.epoch, step)
         vals = self.hour_raw[b0 * m:b1 * m].reshape(b1 - b0, m, 2, NS).sum(axis=1)
         starts = self.epoch + np.arange(b0, b1, dtype=np.int64) * step
+        # partial buckets: full hours from the hourly tree, rows only for the partial hours
         if f2 > starts[0]:
-            vals[0] = self.edge_status(f2, min(int(starts[0]) + step, t2))
+            vals[0] = self.range_status(f2, min(int(starts[0]) + step, t2))
         last_end = int(starts[-1]) + step
         if t2 < last_end and (b1 - b0 > 1 or f2 == starts[0]):
-            vals[-1] = self.edge_status(max(int(starts[-1]), f2), t2)
+            vals[-1] = self.range_status(max(int(starts[-1]), f2), t2)
         return starts, vals
 
 
@@ -382,6 +420,9 @@ class Engine:
         self.tenants = {}
         self.tiers = {}
         self.names = {}
+        self.categories = ["other"]  # product category vocabulary (code -> name)
+        self._cat_index = {"other": 0}
+        self.owner = None  # OwnerIndex across every store (zeta/owner.py), built after bootstrap
         self.stream_of = {}  # tenant id -> the store database stream it lives in
         self.epoch = 0
         self.T = 0
@@ -411,8 +452,8 @@ class Engine:
         status_case = "CASE status " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(STATUSES)) + " END"
         tenants = self._copy(cur, "SELECT tenant_id, tier, name FROM tenants", ["tid", "tier", "name"],
                              {"tier": pa.string(), "name": pa.string()})
-        prods = self._copy(cur, "SELECT product_id, tenant_id, name FROM products ORDER BY tenant_id, product_id",
-                           ["pid", "tid", "name"], {"name": pa.string()})
+        prods = self._copy(cur, "SELECT product_id, tenant_id, name, category FROM products ORDER BY tenant_id, product_id",
+                           ["pid", "tid", "name", "cat"], {"name": pa.string(), "cat": pa.string()})
         o = self._copy(cur, f"SELECT order_id, tenant_id, {status_case}, total_cents, "
                             f"(extract(epoch FROM created_at) * 1000000)::bigint, {HASH_SQL} FROM orders",
                        ["oid", "tid", "st", "tot", "cr", "hx"])
@@ -444,7 +485,7 @@ class Engine:
         for tid in sorted(set(tenants["tid"].tolist()) | set(o["tid"].tolist())):
             t = Tenant(tid, epoch, T)
             pa_, pb = np.searchsorted(prod_tid, tid, "left"), np.searchsorted(prod_tid, tid, "right")
-            t.set_products(prods["pid"][pa_:pb], prods["name"][pa_:pb])
+            t.set_products(prods["pid"][pa_:pb], prods["name"][pa_:pb], [self.cat_code(c) for c in prods["cat"][pa_:pb]])
             lo_, hi_ = np.searchsorted(o["tid"], tid, "left"), np.searchsorted(o["tid"], tid, "right")
             ia, ib = ptr[lo_], ptr[hi_]
             t.b_created = o["cr"][lo_:hi_].copy()
@@ -490,6 +531,9 @@ class Engine:
 
         with self.lock:
             rebuilt = set(tenants_new)
+            if self.owner is not None:  # stale until rebuilt: owner queries use the per-store path meanwhile
+                self.owner.detach()
+                self.owner = None
             self.tenants.update(tenants_new)
             if not self.T:
                 self.epoch, self.T = epoch, T
@@ -505,6 +549,23 @@ class Engine:
             self.stats["bootstrapped_at"] = time.time()
         return {"orders": int(len(o["oid"])), "items": int(len(it["oid"])),
                 "bootstrap_s": round(time.time() - t0, 2), "read_s": round(t_read, 2)}
+
+    def cat_code(self, name):
+        with self.lock:
+            c = self._cat_index.get(name)
+            if c is None:
+                c = self._cat_index[name] = len(self.categories)
+                self.categories.append(name)
+            return c
+
+    def build_owner(self):
+        """(Re)build the all-store owner index from the per-store state; deltas keep it current afterwards."""
+        from .owner import OwnerIndex
+        with self.lock:
+            for t in self.tenants.values():
+                t.owner = None
+            self.owner = OwnerIndex(self)
+            return self.owner.stats
 
     # ---------- applying CDC transactions ----------
     def tenant(self, tid):
@@ -549,8 +610,15 @@ class Engine:
         elif table == "order_items":
             self._apply_item(kind, old, new)
         elif table == "products" and kind in ("INSERT", "UPDATE"):
-            self.tenant(new["tenant_id"]).pidx_of(new["product_id"], new["name"])
+            t = self.tenant(new["tenant_id"])
+            i = t.pidx_of(new["product_id"], new["name"])
+            t.pid_cat[i] = self.cat_code(new.get("category") or "other")
+            if t.owner is not None:
+                t.owner.p_cat[t.g_pmap[i]] = t.pid_cat[i]
         elif table == "tenants" and kind in ("INSERT", "UPDATE"):
+            if new["tenant_id"] not in self.tenants and self.owner is not None:
+                self.owner.detach()  # a brand-new store: owner queries fall back to per-store until rebuilt
+                self.owner = None
             self.tenant(new["tenant_id"])
             self.tiers[new["tenant_id"]] = new["tier"]
         elif kind == "TRUNCATE":
@@ -587,7 +655,7 @@ class Engine:
             if ov is not None:
                 t.ov_remove(oid)
             else:
-                t.b_status[pos] = DELETED
+                t.set_base(pos, status=DELETED)
             return
         # UPDATE
         if new["tenant_id"] != old["tenant_id"]:
@@ -597,8 +665,7 @@ class Engine:
         if COUNTED[n_st]:
             t.prod_delta(new["created_at"], items, +1)
         if ov is None and new["created_at"] == int(t.b_created[pos]):
-            t.b_status[pos] = n_st
-            t.b_total[pos] = new["total_cents"]
+            t.set_base(pos, status=n_st, total=new["total_cents"])
             return
         if ov is None:
             ov = t.promote(pos)
@@ -676,10 +743,17 @@ class Engine:
     def owner_count(self, tids, f, t):
         """{tid: [2, NS] vector} for each store; the owner's totals are their sum (exact)."""
         with self.lock:
+            if self.owner is not None:  # one pass over the all-store index, whatever the store count
+                v = self.owner.range_status(f, t)
+                pos = {tid: i for i, tid in enumerate(self.owner.tids)}
+                return {tid: v[pos[tid]] for tid in tids if tid in pos}
             return {tid: self.tenants[tid].range_status(f, t) for tid in tids if tid in self.tenants}
 
     def owner_trend(self, tids, f, t, step):
         with self.lock:
+            if self.owner is not None:
+                starts, vals = self.owner.trend(f, t, step, self.owner.mask(tids))
+                return starts, vals.sum(axis=1)
             parts = [self.tenants[tid].trend(f, t, step) for tid in tids if tid in self.tenants]
         parts = [(s, v) for s, v in parts if len(s)]
         if not parts:
@@ -695,6 +769,8 @@ class Engine:
     def owner_top(self, tids, f, t, n):
         """Exact top-N across stores: the global top N is inside the union of each store's top N."""
         with self.lock:
+            if self.owner is not None:
+                return self.owner.top(f, t, n, self.owner.mask(tids))
             cands = []
             for tid in tids:
                 ten = self.tenants.get(tid)
@@ -702,3 +778,27 @@ class Engine:
                     cands += [(-s, pid, name, tid) for pid, name, s in self._topn(ten, ten.range_products(f, t), n)]
         cands.sort()
         return [(pid, name, -neg, tid) for neg, pid, name, tid in cands[:n]]
+
+    def owner_sales_by_store(self, tids, f, t):
+        """{tid: product sales (counted statuses)} for the selected stores, exact."""
+        with self.lock:
+            if self.owner is not None:
+                o = self.owner
+                v = o.range_products(f, t)
+                per = np.bincount(o.p_store, weights=v, minlength=o.S).astype(np.int64)
+                pos = {tid: i for i, tid in enumerate(o.tids)}
+                return {tid: int(per[pos[tid]]) for tid in tids}
+            return {tid: int(self.tenants[tid].range_products(f, t).sum()) for tid in tids}
+
+    def owner_categories(self, tids, f, t):
+        """{category: sales} across the selected stores (counted statuses), exact."""
+        with self.lock:
+            if self.owner is not None:
+                v = self.owner.by_category(f, t, self.owner.mask(tids))
+            else:
+                v = np.zeros(len(self.categories), np.int64)
+                for tid in tids:
+                    ten = self.tenants[tid]
+                    v += np.bincount(ten.pid_cat, weights=ten.range_products(f, t),
+                                     minlength=len(self.categories)).astype(np.int64)
+            return {self.categories[i]: int(x) for i, x in enumerate(v) if x}

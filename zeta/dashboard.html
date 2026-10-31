@@ -3,45 +3,67 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Owner Dashboard</title>
+<title>ZETA Dashboard</title>
 <style>
-  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1b; --ink2:#4a4a46; --muted:#6b6b66; --line:#e3e3de; --grid:#ededea;
-          --bar:#3b5bdb; --soft:#e8edff; --flash:#fff3c4; --bad:#c23b3b; }
+  :root { --bg:#f6f6f3; --card:#fff; --ink:#1d1d1b; --ink2:#46463f; --muted:#6b6b66; --line:#e3e3de; --grid:#ececE8;
+          --bar:#3b5bdb; --soft:#e8edff; --flash:#fff3c4; --good:#1f8a4c; --bad:#c23b3b; --warn:#a86a00; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#141413; --card:#1e1e1c; --ink:#ececea; --ink2:#c9c9c4; --muted:#9a9a94; --line:#33332f; --grid:#2a2a27;
-            --bar:#7c94ff; --soft:#232a45; --flash:#4a3f12; --bad:#ff7b7b; }
+    :root { --bg:#131312; --card:#1d1d1b; --ink:#ececea; --ink2:#c9c9c4; --muted:#9a9a94; --line:#33332f; --grid:#2a2a27;
+            --bar:#7c94ff; --soft:#232a45; --flash:#4a3f12; --good:#4fd18b; --bad:#ff7b7b; --warn:#f0b429; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, system-ui, sans-serif; }
-  main { max-width:1150px; margin:0 auto; padding:18px 16px 48px; }
-  header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:10px; margin-bottom:12px; }
+  main { max-width:1200px; margin:0 auto; padding:16px 16px 56px; }
+  header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:10px; margin-bottom:10px; }
   h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 10px; }
   .muted { color:var(--muted); font-size:12px; }
   .fresh { font-size:12px; color:var(--muted); text-align:right; }
+  nav { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:12px; overflow-x:auto; }
+  nav button { border:0; background:transparent; color:var(--ink2); padding:8px 12px; font:inherit; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap; }
+  nav button.on { color:var(--ink); font-weight:600; border-bottom-color:var(--bar); }
   .filters { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
-  select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
-  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-bottom:12px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; transition:background .6s; min-width:0; }
+  select, input, button { font:inherit; }
+  select, input { padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { border:0; background:transparent; color:var(--ink2); padding:4px 10px; cursor:pointer; }
+  .seg button.on { background:var(--soft); color:var(--ink); font-weight:600; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:10px; margin-bottom:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; min-width:0; transition:background .6s; }
   .card.flash { background:var(--flash); transition:none; }
-  .k { color:var(--muted); font-size:12px; } .v { font-size:24px; font-weight:650; font-variant-numeric:tabular-nums; }
-  .sub { color:var(--ink2); font-size:13px; font-variant-numeric:tabular-nums; }
+  .k { color:var(--muted); font-size:12px; } .v { font-size:22px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .d { font-size:12px; font-variant-numeric:tabular-nums; color:var(--ink2); }
+  .up { color:var(--good); } .down { color:var(--bad); }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:12px; margin-bottom:12px; }
-  @media (max-width:860px) { .grid2 { grid-template-columns:1fr; } }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:12px; }
+  @media (max-width:900px) { .grid2, .grid3 { grid-template-columns:1fr; } }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
   td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:right; vertical-align:middle; }
   td:first-child, th:first-child { text-align:left; } th { color:var(--muted); font-weight:500; font-size:12px; }
-  .barcell { width:32%; } .hbar { height:10px; background:var(--bar); border-radius:0 4px 4px 0; min-width:1px; }
+  th.sort { cursor:pointer; } th.sort:hover { color:var(--ink); }
+  .barcell { width:30%; } .hbar { height:10px; background:var(--bar); border-radius:0 4px 4px 0; min-width:1px; }
   tr.click { cursor:pointer; } tr.click:hover td { background:var(--soft); }
-  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  .seg button { border:0; background:transparent; color:var(--ink2); padding:4px 10px; font:inherit; cursor:pointer; }
-  .seg button.on { background:var(--soft); color:var(--ink); font-weight:600; }
-  #chart { position:relative; } svg text { fill:var(--muted); font-size:11px; }
-  .tip { position:absolute; pointer-events:none; background:var(--ink); color:var(--bg); font-size:12px; padding:5px 8px; border-radius:6px; white-space:nowrap; transform:translate(-50%, -110%); display:none; }
-  .login { max-width:460px; margin:60px auto; }
-  input { font:inherit; width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); margin:8px 0; }
-  button.primary { background:var(--bar); color:#fff; border:0; border-radius:8px; padding:8px 14px; font:inherit; cursor:pointer; }
+  .scroll { max-height:520px; overflow:auto; }
+  .chart { position:relative; } svg text { fill:var(--muted); font-size:11px; }
+  .tip { position:absolute; pointer-events:none; background:var(--ink); color:var(--bg); font-size:12px; padding:5px 8px; border-radius:6px; white-space:nowrap; transform:translate(-50%, -110%); display:none; z-index:5; }
+  .heat { display:grid; grid-template-columns:34px repeat(24, 1fr); gap:2px; font-size:10px; color:var(--muted); }
+  .heat div.c { height:18px; border-radius:3px; background:var(--bar); }
+  .flag { color:var(--warn); font-size:12px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .chips button { border:1px solid var(--line); background:var(--card); color:var(--ink2); border-radius:99px; padding:3px 10px; cursor:pointer; font-size:12px; }
+  .chips button:hover { background:var(--soft); }
+  button.primary { background:var(--bar); color:#fff; border:0; border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.danger { background:transparent; color:var(--bad); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--ink2); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  code, pre { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  .cells { display:grid; grid-template-columns:repeat(auto-fill, minmax(30px, 1fr)); gap:4px; margin:8px 0; }
+  .cell { height:24px; border-radius:5px; font-size:10px; display:flex; align-items:center; justify-content:center; color:#fff; }
+  .cell.ok { background:var(--good); } .cell.bad { background:var(--bad); } .cell.unk { background:var(--muted); }
+  .pill { display:inline-block; padding:1px 9px; border-radius:99px; color:#fff; font-size:12px; font-weight:600; }
+  .pill.ok { background:var(--good); } .pill.bad { background:var(--bad); } .pill.unk { background:var(--muted); }
+  .login { max-width:480px; margin:60px auto; } .login input { width:100%; margin:8px 0; }
   .err { color:var(--bad); }
-  .scroll { max-height:420px; overflow:auto; }
+  .hide { display:none !important; }
 </style>
 </head>
 <body>
@@ -49,162 +71,312 @@
 <script>
 const $ = id => document.getElementById(id);
 const rupees = c => '₹' + (c / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const rupees0 = c => '₹' + Math.round(c / 100).toLocaleString('en-IN');
+const rupeesShort = c => { const r = c / 100; return r >= 1e7 ? '₹' + (r / 1e7).toFixed(2) + ' Cr' : r >= 1e5 ? '₹' + (r / 1e5).toFixed(2) + ' L' : rupees0(c); };
 const num = n => n.toLocaleString('en-IN');
+const pct = r => (r * 100).toFixed(1) + '%';
 const STATUSES = ['placed', 'shipped', 'delivered', 'cancelled', 'returned'];
+const RANGES = { today: 'Today', '7d': '7 days', '30d': '30 days', '90d': '90 days' };
 const params = new URLSearchParams(location.search);
-const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
-let key = params.get('key') || store.get('zeta-owner-key');
-let gran = 'hour', range = 'today', pick = '', prev = {}, lastChange = null, stores = [], timer = null;
+const ls = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+let key = params.get('key') || ls.get('zeta-key');
+let role = null, myStore = null, stores = [], tab = 'overview', range = '7d', pick = '', gran = 'hour';
+let timer = null, prev = {}, sortBy = ['revenue', -1];
 
-function loginForm(msg) {
-  clearInterval(timer);
-  $('app').innerHTML = `<div class="card login"><h1>Owner dashboard</h1>
-    <p class="muted">Paste the owner key (zo_…). It opens every store's numbers, aggregated across all store databases.</p>
-    <input id="k" placeholder="zo_…" value="${key || ''}"><button class="primary" onclick="useKey()">Open dashboard</button>
-    ${msg ? `<p class="err">${msg}</p>` : ''}</div>`;
-}
-function useKey() { key = $('k').value.trim(); store.set('zeta-owner-key', key); start(); }
-
-function shell() {
-  $('app').innerHTML = `
-  <header><div><h1>All stores</h1><div class="muted" id="subtitle">Live from ZETA · aggregated across every store database</div></div>
-    <div class="fresh" id="fresh">…</div></header>
-  <div class="filters">
-    <label class="muted" for="pick">Store</label><select id="pick"><option value="">All stores</option></select>
-    <div class="seg" id="ranges"><button data-r="today" class="on">Today</button><button data-r="7d">7 days</button><button data-r="30d">30 days</button></div>
-  </div>
-  <div class="tiles">
-    <div class="card" id="t-n"><div class="k">Orders</div><div class="v" id="n">–</div><div class="sub" id="n-sub"></div></div>
-    <div class="card" id="t-r"><div class="k">Revenue</div><div class="v" id="r">–</div><div class="sub" id="r-sub"></div></div>
-    <div class="card" id="t-c"><div class="k">Cancelled</div><div class="v" id="c">–</div><div class="sub" id="c-sub"></div></div>
-    <div class="card"><div class="k">Last change seen</div><div class="v" id="chg" style="font-size:18px">–</div><div class="sub" id="chg-t"></div></div>
-  </div>
-  <div class="grid2">
-    <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <h2 style="margin:0" id="trend-title">Orders per hour</h2>
-        <div class="seg"><button id="g-hour" class="on" onclick="setGran('hour')">48 hours</button><button id="g-day" onclick="setGran('day')">30 days</button></div></div>
-      <div id="chart"></div><div class="muted" id="trend-note"></div></div>
-    <div class="card" id="t-status"><h2>Orders by status</h2><table id="status"></table></div>
-  </div>
-  <div class="grid2">
-    <div class="card" id="t-stores"><h2>Stores by revenue</h2><div class="muted" style="margin-bottom:6px">Each store is its own database · click a store to focus on it</div>
-      <div class="scroll"><table id="bystore"></table></div></div>
-    <div class="card" id="t-top"><h2>Top 10 products by sales</h2><table id="top"></table>
-      <div class="muted" style="margin-top:6px">Across the selected stores · sales exclude cancelled and returned orders</div></div>
-  </div>`;
-  $('pick').innerHTML = '<option value="">All stores</option>' + stores.map(s => `<option value="${s.tenant_id}">${s.tenant_id} · ${s.name} (${s.tier}) · ${s.database}</option>`).join('');
-  $('pick').onchange = () => { pick = $('pick').value; prev = {}; tick(); };
-  $('ranges').querySelectorAll('button').forEach(b => b.onclick = () => {
-    range = b.dataset.r; $('ranges').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); prev = {}; tick(); });
-}
-function setGran(g) { gran = g; $('g-hour').classList.toggle('on', g === 'hour'); $('g-day').classList.toggle('on', g === 'day'); tick(); }
-function focusStore(tid) { pick = String(tid); $('pick').value = pick; prev = {}; tick(); }
-
-async function get(path, q) {
+// ---------- plumbing ----------
+async function get(path, q = {}, method = 'GET') {
   const u = new URL(path, location.origin);
   for (const [k, v] of Object.entries(q)) if (v != null && v !== '') u.searchParams.set(k, v);
-  const r = await fetch(u, { headers: { 'X-API-Key': key } });
+  const r = await fetch(u, { method, headers: { 'X-API-Key': key } });
   const body = await r.json();
   if (!r.ok) throw Object.assign(new Error(body.detail || r.status), { status: r.status });
   return body;
 }
-function flash(id, changed) { if (!changed) return; const el = $(id); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 60); }
+function win() {
+  // calendar days in local time: "7 days" = today + the 6 days before; numbers only move when data does
+  const from = new Date(); from.setHours(0, 0, 0, 0);
+  from.setDate(from.getDate() - ({ today: 1, '7d': 7, '30d': 30, '90d': 90 }[range] - 1));
+  const to = new Date(); to.setHours(24, 0, 0, 0);
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+const scope = () => role === 'store' ? String(myStore) : pick;
+function delta(ch, invert) {
+  if (ch == null) return '<span class="d">no previous data</span>';
+  const good = invert ? ch < 0 : ch > 0, arrow = ch > 0 ? '▲' : ch < 0 ? '▼' : '■';
+  return `<span class="d ${ch === 0 ? '' : good ? 'up' : 'down'}" title="vs the previous ${RANGES[range].toLowerCase()}">${arrow} ${Math.abs(ch).toFixed(1)}% vs prev. period</span>`;
+}
+function flash(id, sig) { const el = $(id); if (!el) return; if (prev[id] !== undefined && prev[id] !== sig) { el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 60); } prev[id] = sig; }
+function hbars(rows, fmt, opts = {}) {
+  const max = Math.max(1, ...rows.map(r => r.value));
+  return `<table>${opts.head || ''}${rows.map(r => `<tr${r.click ? ` class="click" onclick="${r.click}"` : ''}><td>${r.label}</td><td class="barcell"><div class="hbar" style="width:${100 * r.value / max}%"></div></td><td>${fmt(r.value)}</td>${r.extra ? `<td>${r.extra}</td>` : ''}</tr>`).join('')}</table>`;
+}
 
-function drawChart(buckets) {
-  const W = $('chart').clientWidth || 600, H = 200, padL = 48, padB = 22, padT = 8;
-  const max = Math.max(1, ...buckets.map(b => b.count));
-  const nice = Math.pow(10, Math.floor(Math.log10(max))); const top = Math.ceil(max / nice) * nice;
+// ---------- charts ----------
+function barChart(el, buckets, label, valueOf, fmt) {
+  const W = el.clientWidth || 600, H = 200, padL = 52, padB = 22, padT = 8;
+  const vals = buckets.map(valueOf), max = Math.max(1, ...vals);
+  const nice = Math.pow(10, Math.floor(Math.log10(max))), top = Math.ceil(max / nice) * nice;
   const n = Math.max(1, buckets.length), slot = (W - padL) / n, bw = Math.max(1, slot - 2);
   const y = v => padT + (H - padT - padB) * (1 - v / top);
-  let svg = `<svg width="${W}" height="${H}" role="img" aria-label="Orders per ${gran}">`;
-  for (let i = 0; i <= 4; i++) { const v = top * i / 4, yy = y(v);
-    svg += `<line x1="${padL}" x2="${W}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/><text x="${padL - 6}" y="${yy + 4}" text-anchor="end">${num(Math.round(v))}</text>`; }
-  buckets.forEach((b, i) => {
-    const x = padL + i * slot + 1, y0 = y(0), y1 = y(b.count), h = y0 - y1, r = Math.min(4, bw / 2, h);
+  let svg = `<svg width="${W}" height="${H}" role="img" aria-label="${label}">`;
+  for (let i = 0; i <= 4; i++) { const v = top * i / 4, yy = y(v); svg += `<line x1="${padL}" x2="${W}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/><text x="${padL - 6}" y="${yy + 4}" text-anchor="end">${fmt(v, true)}</text>`; }
+  vals.forEach((v, i) => {
+    const x = padL + i * slot + 1, y0 = y(0), y1 = y(v), h = y0 - y1, r = Math.min(4, bw / 2, h);
     if (h > 0) svg += `<path d="M${x},${y0} V${y1 + r} Q${x},${y1} ${x + r},${y1} H${x + bw - r} Q${x + bw},${y1} ${x + bw},${y1 + r} V${y0} Z" fill="var(--bar)"/>`;
     svg += `<rect x="${x - 1}" y="${padT}" width="${slot}" height="${H - padT - padB}" fill="transparent" data-i="${i}"/>`;
   });
   const every = Math.ceil(n / 8);
-  buckets.forEach((b, i) => { if (i % every === 0) {
-    const d = new Date(b.bucket), lab = gran === 'hour' ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' });
-    svg += `<text x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${lab}</text>`; } });
-  svg += `</svg><div class="tip" id="tip"></div>`;
-  $('chart').innerHTML = svg;
-  $('chart').querySelectorAll('rect[data-i]').forEach(r => {
-    r.onmousemove = e => { const b = buckets[r.dataset.i], d = new Date(b.bucket), tip = $('tip');
-      tip.innerHTML = `${gran === 'hour' ? d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' (UTC day)'}<br><b>${num(b.count)} orders</b> · ${rupees(b.revenue_cents)}`;
-      const box = $('chart').getBoundingClientRect(); tip.style.left = (e.clientX - box.left) + 'px'; tip.style.top = (e.clientY - box.top) + 'px'; tip.style.display = 'block'; };
-    r.onmouseleave = () => { $('tip').style.display = 'none'; };
+  buckets.forEach((b, i) => { if (i % every === 0) svg += `<text x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${b.short}</text>`; });
+  el.innerHTML = svg + `</svg><div class="tip"></div>`;
+  const tip = el.querySelector('.tip');
+  el.querySelectorAll('rect[data-i]').forEach(r => {
+    r.onmousemove = e => { const b = buckets[r.dataset.i]; tip.innerHTML = `${b.long}<br><b>${fmt(valueOf(b))}</b>${b.more ? ' · ' + b.more : ''}`;
+      const box = el.getBoundingClientRect(); tip.style.left = (e.clientX - box.left) + 'px'; tip.style.top = (e.clientY - box.top) + 'px'; tip.style.display = 'block'; };
+    r.onmouseleave = () => { tip.style.display = 'none'; };
   });
 }
-
-function rangeStart(now) {
-  if (range === 'today') { const m = new Date(now); m.setHours(0, 0, 0, 0); return m; }
-  return new Date(now - (range === '7d' ? 7 : 30) * 864e5);
+function spark(vals) {
+  const W = 110, H = 26, max = Math.max(1, ...vals), n = vals.length;
+  const pts = vals.map((v, i) => `${(i / Math.max(1, n - 1)) * (W - 4) + 2},${H - 3 - (v / max) * (H - 6)}`).join(' ');
+  return `<svg width="${W}" height="${H}" aria-label="daily orders"><polyline points="${pts}" fill="none" stroke="var(--bar)" stroke-width="2" stroke-linejoin="round"/></svg>`;
 }
 
-async function tick() {
-  const now = new Date(), from = rangeStart(now).toISOString();
-  const s = pick || null;
+// ---------- shell ----------
+function loginForm(msg) {
+  clearInterval(timer);
+  $('app').innerHTML = `<div class="card login"><h1>ZETA dashboard</h1>
+    <p class="muted">Paste a key. The company owner key (zo_…) opens every store and the operations tab; a store key (zt_…) opens only that store.</p>
+    <input id="k" placeholder="zo_… or zt_…" value="${key || ''}"><button class="primary" onclick="useKey()">Open</button>
+    ${msg ? `<p class="err">${msg}</p>` : ''}</div>`;
+}
+function useKey() { key = $('k').value.trim(); ls.set('zeta-key', key); start(); }
+function shell() {
+  const owner = role !== 'store';
+  $('app').innerHTML = `
+  <header><div><h1>${owner ? 'All stores' : 'Store ' + myStore}</h1>
+    <div class="muted">${owner ? `Company owner · ${stores.length} stores, each in its own database · live from ZETA` : 'Your store only · live from ZETA'}</div></div>
+    <div class="fresh" id="fresh">…</div></header>
+  <nav>
+    <button data-t="overview">Overview</button>
+    ${owner ? '<button data-t="stores">Stores</button>' : ''}
+    <button data-t="explore">Explore</button>
+    ${owner ? '<button data-t="ops">Operations</button>' : ''}
+  </nav>
+  <div class="filters" id="filters">
+    ${owner ? `<label class="muted" for="pick">Store</label><select id="pick"><option value="">All stores</option>${stores.map(s => `<option value="${s.tenant_id}">${s.tenant_id} · ${s.name} (${s.tier}) · ${s.database}</option>`).join('')}</select>` : ''}
+    <div class="seg" id="ranges">${Object.entries(RANGES).map(([k, v]) => `<button data-r="${k}">${v}</button>`).join('')}</div>
+  </div>
+  <section id="t-overview"></section><section id="t-stores"></section><section id="t-explore"></section><section id="t-ops"></section>`;
+  document.querySelectorAll('nav button').forEach(b => b.onclick = () => go(b.dataset.t));
+  document.querySelectorAll('#ranges button').forEach(b => b.onclick = () => { range = b.dataset.r; prev = {}; paintFilters(); refresh(); });
+  if ($('pick')) $('pick').onchange = () => { pick = $('pick').value; prev = {}; refresh(); };
+  paintFilters();
+}
+function paintFilters() {
+  document.querySelectorAll('#ranges button').forEach(b => b.classList.toggle('on', b.dataset.r === range));
+  if ($('pick')) $('pick').value = pick;
+  $('filters').classList.toggle('hide', tab === 'ops');
+  if ($('pick')) $('pick').parentElement && ($('pick').style.display = tab === 'stores' ? 'none' : '');
+  document.querySelectorAll('label[for=pick]').forEach(l => l.style.display = tab === 'stores' ? 'none' : '');
+}
+function go(t) {
+  tab = t; location.hash = t;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
+  ['overview', 'stores', 'explore', 'ops'].forEach(x => $('t-' + x).classList.toggle('hide', x !== t));
+  paintFilters(); refresh();
+}
+function refresh() {
+  clearInterval(timer);
+  const f = { overview: tickOverview, stores: tickStores, explore: tickExplore, ops: tickOps }[tab];
+  f(); if (tab !== 'explore') timer = setInterval(f, tab === 'ops' ? 2000 : 3000);
+}
+function fresh(fr, took) {
+  if (!fr) return;
+  $('fresh').innerHTML = fr.databases != null
+    ? `${fr.databases} store database${fr.databases > 1 ? 's' : ''} · max lag ${fr.max_cdc_lag_ms == null ? '–' : Math.round(fr.max_cdc_lag_ms) + ' ms'}<br>last change ${fr.updated_s_ago == null ? '–' : fr.updated_s_ago + ' s ago'} · query ${took} ms`
+    : `database ${fr.database} · lag ${fr.cdc_lag_ms == null ? '–' : Math.round(fr.cdc_lag_ms) + ' ms'}<br>last change ${fr.updated_s_ago == null ? '–' : fr.updated_s_ago + ' s ago'} · query ${took} ms`;
+}
+function fail(e) {
+  if (e.status === 401 || e.status === 403) { loginForm('That key was not accepted: ' + e.message); return; }
+  $('fresh').innerHTML = `<span class="err">${e.status === 429 ? 'Rate limit reached, slowing down' : 'Cannot reach ZETA: ' + e.message}</span>`;
+}
+
+// ---------- Overview ----------
+function overviewShell() {
+  if ($('ov-kpis')) return;
+  $('t-overview').innerHTML = `
+  <div class="tiles" id="ov-kpis"></div>
+  <div class="grid2">
+    <div class="card" id="c-trend"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <h2 style="margin:0" id="trend-title">Orders per hour</h2>
+      <div class="seg" id="gran"><button data-g="hour">48 hours</button><button data-g="day">30 days</button></div></div>
+      <div class="chart" id="trend"></div><div class="muted" id="trend-note"></div></div>
+    <div class="card" id="c-cat"><h2>Sales by product category</h2><div id="cats"></div><div class="muted" style="margin-top:6px">Item sales, excluding cancelled and returned orders</div></div>
+  </div>
+  <div class="grid3">
+    <div class="card" id="c-status"><h2>Orders by status</h2><div id="status"></div></div>
+    <div class="card" id="c-top" style="grid-column:span 2"><h2>Top 10 products by sales</h2><div id="top"></div></div>
+  </div>
+  <div class="card" id="c-heat"><h2>When do customers buy? Orders by weekday and hour</h2><div id="heat"></div>
+    <div class="muted" style="margin-top:6px">Last 28 days · UTC hours · darker = more orders · hover a cell for the count</div></div>`;
+  document.querySelectorAll('#gran button').forEach(b => b.onclick = () => { gran = b.dataset.g; tickOverview(); });
+}
+async function tickOverview() {
+  overviewShell();
+  document.querySelectorAll('#gran button').forEach(b => b.classList.toggle('on', b.dataset.g === gran));
+  const w = win(), s = scope(), now = new Date();
   const tFrom = gran === 'hour' ? new Date(Math.floor((now - 47 * 36e5) / 36e5) * 36e5) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29));
   const tTo = gran === 'hour' ? new Date(Math.ceil((+now + 1) / 36e5) * 36e5) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
   try {
-    const [cnt, st, tr, bs, top] = await Promise.all([
-      get('/owner/orders/count', { from, stores: s }),
-      get('/owner/orders/by-status', { from, stores: s }),
+    const [sm, tr, top, hm] = await Promise.all([
+      get('/analytics/summary', { ...w, stores: s }),
       get('/owner/orders/trend', { from: tFrom.toISOString(), to: tTo.toISOString(), granularity: gran, stores: s }),
-      get('/owner/orders/by-store', { from }),
-      get('/owner/products/top', { from, n: 10, stores: s }),
+      get('/owner/products/top', { ...w, n: 10, stores: s }),
+      get('/analytics/heatmap', { from: new Date(now - 28 * 864e5).toISOString(), to: w.to, stores: s }),
     ]);
-    const label = { today: 'today', '7d': 'last 7 days', '30d': 'last 30 days' }[range];
-    const scope = pick ? `store ${pick}` : `${cnt.stores} stores`;
-    const c = st.by_status.cancelled;
-    $('subtitle').textContent = `Live from ZETA · ${scope} · aggregated across store databases`;
-    $('n').textContent = num(cnt.count); $('n-sub').textContent = `${label} · ${scope}`;
-    $('r').textContent = rupees(cnt.revenue_cents); $('r-sub').textContent = `all statuses · ${label}`;
-    $('c').textContent = num(c.count); $('c-sub').textContent = rupees(c.revenue_cents);
-    const maxS = Math.max(1, ...STATUSES.map(x => st.by_status[x].count));
-    $('status').innerHTML = `<tr><th>status</th><th class="barcell"></th><th>orders</th><th>value</th></tr>` + STATUSES.map(x =>
-      `<tr><td>${x}</td><td class="barcell"><div class="hbar" style="width:${100 * st.by_status[x].count / maxS}%"></div></td><td>${num(st.by_status[x].count)}</td><td>${rupees(st.by_status[x].revenue_cents)}</td></tr>`).join('');
-    const maxB = Math.max(1, ...bs.by_store.map(x => x.revenue_cents));
-    $('bystore').innerHTML = `<tr><th>store</th><th>database</th><th class="barcell"></th><th>orders</th><th>revenue</th></tr>` + bs.by_store.map(x =>
-      `<tr class="click" onclick="focusStore(${x.tenant_id})"${String(x.tenant_id) === pick ? ' style="font-weight:600"' : ''}><td>${x.tenant_id} · ${x.name}</td><td class="muted">${x.database}</td>
-       <td class="barcell"><div class="hbar" style="width:${100 * x.revenue_cents / maxB}%"></div></td><td>${num(x.count)}</td><td>${rupees(x.revenue_cents)}</td></tr>`).join('');
-    const maxP = Math.max(1, ...top.products.map(p => p.sales_cents));
-    $('top').innerHTML = `<tr><th>#</th><th>product</th><th>store</th><th class="barcell"></th><th>sales</th></tr>` + (top.products.map((p, i) =>
-      `<tr><td>${i + 1}</td><td style="text-align:left">${p.name}</td><td>${p.tenant_id}</td><td class="barcell"><div class="hbar" style="width:${100 * p.sales_cents / maxP}%"></div></td><td>${rupees(p.sales_cents)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">No sales yet</td></tr>');
+    const k = sm.kpis, c = sm.change_pct;
+    const tiles = [['Orders', num(k.orders), delta(c.orders)], ['Revenue', rupeesShort(k.revenue), delta(c.revenue), rupees(k.revenue)],
+      ['Net sales', rupeesShort(k.net_sales), delta(c.net_sales), rupees(k.net_sales)], ['Average order value', rupees(k.aov), delta(c.aov)],
+      ['Cancel rate', pct(k.cancel_rate), delta(c.cancel_rate, true)], ['Return rate', pct(k.return_rate), delta(c.return_rate, true)]];
+    $('ov-kpis').innerHTML = tiles.map(([label, v, d, full], i) => `<div class="card" id="kpi${i}"><div class="k">${label}</div><div class="v"${full ? ` title="${full}"` : ''}>${v}</div>${d}</div>`).join('');
+    tiles.forEach((t, i) => flash('kpi' + i, t[1]));
+    const sb = sm.by_status;
+    $('status').innerHTML = hbars(STATUSES.map(x => ({ label: x, value: sb[x].count, extra: rupees0(sb[x].revenue_cents) })), num);
+    const cats = Object.entries(sm.categories).sort((a, b) => b[1] - a[1]), totalCat = cats.reduce((a, [, v]) => a + v, 0) || 1;
+    $('cats').innerHTML = cats.length ? hbars(cats.map(([cname, v]) => ({ label: cname, value: v, extra: (100 * v / totalCat).toFixed(1) + '%' })), rupees0) : '<div class="muted">No sales in this range</div>';
+    $('top').innerHTML = top.products.length ? hbars(top.products.map((p, i) => ({ label: `${i + 1}. ${p.name} <span class="muted">store ${p.tenant_id}</span>`, value: p.sales_cents })), rupees0) : '<div class="muted">No sales yet</div>';
     $('trend-title').textContent = gran === 'hour' ? 'Orders per hour' : 'Orders per day';
-    $('trend-note').textContent = (gran === 'hour' ? 'Last 48 hours, local time' : 'Last 30 days (UTC days)') + ` · ${scope} · hover a bar for details`;
-    drawChart(tr.buckets);
-
-    const sig = { n: cnt.count + ':' + cnt.revenue_cents, c: c.count, status: JSON.stringify(st.by_status),
-                  stores: JSON.stringify(bs.by_store.map(x => [x.tenant_id, x.count, x.revenue_cents])), top: JSON.stringify(top.products) };
-    if (prev.n) {
-      flash('t-n', sig.n !== prev.n); flash('t-r', sig.n !== prev.n); flash('t-c', sig.c !== prev.c);
-      flash('t-status', sig.status !== prev.status); flash('t-stores', sig.stores !== prev.stores); flash('t-top', sig.top !== prev.top);
-      if (sig.n !== prev.n || sig.c !== prev.c) {
-        const dn = cnt.count - prev.count, dc = c.count - prev.cancelled;
-        lastChange = { at: Date.now(), text: dc > 0 ? `${dc} cancelled` : dn > 0 ? `+${dn} new order${dn > 1 ? 's' : ''}` : dn < 0 ? `${dn} orders` : 'orders updated' };
-      }
-    }
-    Object.assign(prev, sig, { count: cnt.count, cancelled: c.count });
-    if (lastChange) { $('chg').textContent = lastChange.text; $('chg-t').textContent = ((Date.now() - lastChange.at) / 1000).toFixed(0) + ' s ago'; }
-    const f = cnt.freshness || {};
-    $('fresh').innerHTML = `${f.databases ?? '–'} store databases · max ZETA lag ${f.max_cdc_lag_ms == null ? '–' : Math.round(f.max_cdc_lag_ms) + ' ms'}<br>` +
-      `last DB change ${f.updated_s_ago == null ? '–' : f.updated_s_ago + ' s ago'} · query ${cnt.took_ms} ms`;
-  } catch (e) {
-    if (e.status === 401 || e.status === 403) { loginForm('That key was not accepted: ' + e.message); return; }
-    $('fresh').innerHTML = `<span class="err">${e.status === 429 ? 'Slowing down: rate limit reached' : 'Cannot reach ZETA: ' + e.message}</span>`;
-  }
+    $('trend-note').textContent = gran === 'hour' ? 'Last 48 hours, local time · hover a bar' : 'Last 30 days (UTC days) · hover a bar';
+    barChart($('trend'), tr.buckets.map(b => { const d = new Date(b.bucket); return { ...b,
+      short: gran === 'hour' ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' }),
+      long: gran === 'hour' ? d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' (UTC day)',
+      more: rupees0(b.revenue_cents) }; }), 'orders over time', b => b.count, (v, axis) => num(Math.round(v)));
+    const g = hm.grid, gmax = Math.max(1, ...g.flat());
+    $('heat').innerHTML = `<div class="heat"><div></div>${Array.from({ length: 24 }, (_, h) => `<div style="text-align:center">${h % 3 === 0 ? h : ''}</div>`).join('')}` +
+      g.map((row, d) => `<div>${hm.weekdays[d]}</div>` + row.map((v, h) => `<div class="c" title="${hm.weekdays[d]} ${String(h).padStart(2, '0')}:00 UTC · ${num(v)} orders" style="opacity:${(0.08 + 0.92 * v / gmax).toFixed(3)}"></div>`).join('')).join('') + '</div>';
+    flash('c-status', JSON.stringify(sb)); flash('c-top', JSON.stringify(top.products)); flash('c-cat', JSON.stringify(sm.categories));
+    fresh(sm.freshness, sm.took_ms);
+  } catch (e) { fail(e); }
 }
 
+// ---------- Stores ----------
+async function tickStores() {
+  try {
+    const r = await get('/analytics/stores', win());
+    const rows = r.stores_data.slice().sort((a, b) => { const [k, d] = sortBy; return ((a[k] ?? -1e18) > (b[k] ?? -1e18) ? 1 : -1) * d; });
+    const att = rows.filter(x => x.flags.length);
+    const head = (k, l) => `<th class="sort" onclick="sortStores('${k}')">${l}${sortBy[0] === k ? (sortBy[1] < 0 ? ' ▼' : ' ▲') : ''}</th>`;
+    $('t-stores').innerHTML = `
+      <div class="tiles">
+        <div class="card"><div class="k">Stores</div><div class="v">${rows.length}</div><div class="d">each in its own database</div></div>
+        <div class="card"><div class="k">Orders, all stores</div><div class="v">${num(r.overall.orders)}</div><div class="d">${RANGES[range]} · ${rupeesShort(r.overall.revenue)}</div></div>
+        <div class="card"><div class="k">Average order value</div><div class="v">${rupees(r.overall.aov)}</div><div class="d">all stores</div></div>
+        <div class="card"><div class="k">Need attention</div><div class="v">${att.length}</div><div class="d">orders down ≥ 20% or high cancel rate</div></div>
+      </div>
+      <div class="card"><h2>Store health · ${RANGES[range]} vs the previous ${RANGES[range].toLowerCase()}</h2>
+        <div class="muted" style="margin-bottom:6px">Click a column to sort · click a store to open its overview</div>
+        <div class="scroll"><table><tr>${head('tenant_id', 'store')}<th>database</th>${head('orders', 'orders')}${head('revenue', 'revenue')}${head('aov', 'avg order')}${head('cancel_rate', 'cancel %')}${head('growth_pct', 'growth')}<th>daily orders, last 14 days</th><th>attention</th></tr>
+        ${rows.map(x => `<tr class="click" onclick="openStore(${x.tenant_id})"><td>${x.tenant_id} · ${x.name} <span class="muted">${x.tier}</span></td><td class="muted">${x.database}</td>
+          <td>${num(x.orders)}</td><td title="${rupees(x.revenue)}">${rupeesShort(x.revenue)}</td><td>${rupees(x.aov)}</td><td>${pct(x.cancel_rate)}</td>
+          <td>${x.growth_pct == null ? '–' : `<span class="${x.growth_pct >= 0 ? 'up' : 'down'}">${x.growth_pct >= 0 ? '▲' : '▼'} ${Math.abs(x.growth_pct).toFixed(1)}%</span>`}</td>
+          <td>${spark(x.spark)}</td><td class="flag" style="text-align:left">${x.flags.map(f => '⚠ ' + f).join('<br>')}</td></tr>`).join('')}</table></div></div>`;
+    fresh(r.freshness, r.took_ms);
+  } catch (e) { fail(e); }
+}
+function sortStores(k) { sortBy = [k, sortBy[0] === k ? -sortBy[1] : -1]; tickStores(); }
+function openStore(tid) { pick = String(tid); prev = {}; go('overview'); }
+
+// ---------- Explore ----------
+const PRESETS = [['Revenue by store', 'revenue', 'store'], ['Average order value by weekday', 'aov', 'weekday'], ['Cancel rate by hour of day', 'cancel_rate', 'hour_of_day'],
+  ['Sales by category', 'sales', 'category'], ['Top products', 'sales', 'product'], ['Orders per day', 'orders', 'day'], ['Return rate by store', 'return_rate', 'store'], ['Net sales by store', 'net_sales', 'store']];
+function exploreShell() {
+  if ($('ex-run')) return;
+  $('t-explore').innerHTML = `<div class="card">
+    <h2>Explore: any metric, by any dimension</h2>
+    <div class="chips">${PRESETS.map(([l, m, b]) => `<button onclick="preset('${m}','${b}')">${l}</button>`).join('')}</div>
+    <div class="filters">
+      <label class="muted" for="ex-m">Metric</label><select id="ex-m">${['orders', 'revenue', 'net_sales', 'aov', 'cancel_rate', 'return_rate', 'sales'].map(m => `<option>${m}</option>`).join('')}</select>
+      <label class="muted" for="ex-b">by</label><select id="ex-b">${['none', 'store', 'status', 'category', 'product', 'day', 'hour_of_day', 'weekday'].map(b => `<option>${b}</option>`).join('')}</select>
+      <button class="primary" id="ex-run" onclick="tickExplore()">Run</button></div>
+    <div class="muted" id="ex-def"></div><div id="ex-out" style="margin-top:8px"></div>
+    <div class="muted" style="margin-top:10px">API call</div><pre id="ex-api">–</pre></div>`;
+}
+function preset(m, b) { $('ex-m').value = m; $('ex-b').value = b; tickExplore(); }
+async function tickExplore() {
+  exploreShell();
+  const q = { metric: $('ex-m').value, by: $('ex-b').value, ...win(), stores: scope(), n: 20 };
+  const u = new URL('/analytics/explore', location.origin); Object.entries(q).forEach(([k, v]) => v && u.searchParams.set(k, v));
+  $('ex-api').textContent = `GET ${u.pathname}${u.search}\nX-API-Key: ${key.slice(0, 6)}…`;
+  try {
+    const r = await get('/analytics/explore', q);
+    const money = ['revenue', 'net_sales', 'aov', 'sales'].includes(r.metric), rate = r.metric.endsWith('_rate');
+    const fmt = v => rate ? pct(v) : money ? (r.metric === 'aov' ? rupees(v) : rupees0(v)) : num(v);
+    $('ex-def').textContent = `${r.metric}: ${r.definition} · ${r.rows.length} rows · answered by ZETA in ${r.took_ms} ms`;
+    $('ex-out').innerHTML = r.rows.length ? hbars(r.rows.map(x => ({ label: x.key, value: x.value,
+      click: x.tenant_id && role !== 'store' && r.by === 'store' ? `openStore(${x.tenant_id})` : '' })), fmt) : '<div class="muted">No data in this range</div>';
+    fresh(r.freshness, r.took_ms);
+  } catch (e) { if (e.status === 400) { $('ex-out').innerHTML = `<div class="err">${e.message}</div>`; } else fail(e); }
+}
+
+// ---------- Operations ----------
+function opsShell() {
+  if ($('op-tiles')) return;
+  $('t-ops').innerHTML = `
+  <div class="tiles" id="op-tiles"></div>
+  <div class="grid2">
+    <div class="card"><h2>Query latency (server side, last 5000 per route)</h2><table id="op-lat"></table><p class="muted" id="op-info"></p></div>
+    <div class="card"><h2>Audit: ZETA vs each store database at one MVCC snapshot</h2>
+      <div class="cells" id="op-cells"></div><div class="muted" id="op-audit">no audit yet</div>
+      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+        <button class="primary" onclick="act('POST','/admin/audit?localize=true')">Run audit</button>
+        <select id="op-store">${stores.map(s => `<option value="${s.tenant_id}">store ${s.tenant_id}</option>`).join('')}</select>
+        <button class="danger" onclick="act('POST','/admin/corrupt?tenant='+$('op-store').value)">Corrupt a bucket</button>
+        <button class="primary" onclick="act('POST','/admin/audit?localize=true&repair=true')">Audit, localize, repair</button>
+        <button class="ghost" onclick="act('POST','/admin/rebuild?tenant='+$('op-store').value)">Rebuild this store's database</button>
+        <button class="ghost" onclick="if(confirm('Rebuild every store database from scratch?')) act('POST','/admin/rebuild')">Full rebuild</button>
+      </div></div>
+  </div>
+  <div class="card"><h2>Last action</h2><pre id="op-out">–</pre></div>`;
+}
+async function act(method, path) {
+  $('op-out').textContent = method + ' ' + path + ' …';
+  const t0 = performance.now();
+  try { const r = await get(path, {}, method); $('op-out').textContent = `${method} ${path} → ${Math.round(performance.now() - t0)} ms\n\n` + JSON.stringify(r, null, 2); }
+  catch (e) { $('op-out').textContent = `${method} ${path} failed: ${e.message}`; }
+  tickOps();
+}
+async function tickOps() {
+  opsShell();
+  try {
+    const m = await get('/monitor.json'), h = m.health, a = m.audit;
+    $('op-tiles').innerHTML = [['Store databases', h.databases], ['Max CDC lag', h.max_cdc_lag_ms == null ? '–' : Math.round(h.max_cdc_lag_ms) + ' ms'],
+      ['Transactions applied', num(h.txns)], ['Orders at bootstrap', num(h.orders || 0)], ['Broken streams', h.broken_streams.length],
+      ['Audit', a ? `<span class="pill ${a.ok ? 'ok' : 'bad'}">${a.ok ? 'green' : 'RED'}</span>` : '<span class="pill unk">pending</span>']]
+      .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+    $('op-lat').innerHTML = '<tr><th>route</th><th>n</th><th>p50</th><th>p99</th><th>429s</th></tr>' + Object.entries(m.latency).map(([p, v]) =>
+      `<tr><td>${p.replace('/tenants/{tid}', '/tenants/…')}</td><td>${num(v.n)}</td><td>${v.p50_ms} ms</td><td>${v.p99_ms} ms</td><td>${v.rejected_429}</td></tr>`).join('');
+    $('op-info').textContent = `uptime ${m.uptime_s}s · slowest store bootstrap ${h.bootstrap_s}s · engine errors ${h.errors}`;
+    if (a) {
+      $('op-cells').innerHTML = Object.entries(a.tenants).map(([t, ok]) => `<div class="cell ${ok ? 'ok' : 'bad'}" title="store ${t}">${t}</div>`).join('');
+      let info = `${Math.round(Date.now() / 1000 - a.at)}s ago · ${a.databases} databases · took ${a.took_ms} ms (SQL ${a.sql_ms} ms) · ${a.invisible_txns} newer txns subtracted · every ${m.audit_interval_s}s`;
+      for (const l of a.localized || []) info += `<br><b>store ${l.tenant}: bad bucket ${l.hour_start || l.where}</b> found with ${l.sql_queries || '?'} range queries` + (l.repair ? ` · rebuilt · ${l.after_ok ? 'now matches' : 'STILL WRONG'}` : '');
+      $('op-audit').innerHTML = info;
+    } else $('op-cells').innerHTML = stores.map(s => `<div class="cell unk">${s.tenant_id}</div>`).join('');
+  } catch (e) { fail(e); }
+}
+
+// ---------- start ----------
 async function start() {
   clearInterval(timer);
-  if (!key || !key.startsWith('zo_') && !key.startsWith('za_')) { loginForm(key ? 'That is not an owner key (zo_…)' : ''); return; }
-  store.set('zeta-owner-key', key);
-  if (params.get('key')) history.replaceState(null, '', '/dashboard');
-  try { stores = await get('/owner/stores', {}); } catch (e) { loginForm('That key was not accepted: ' + e.message); return; }
-  shell(); prev = {}; tick(); timer = setInterval(tick, 2000);
+  if (!key) { loginForm(''); return; }
+  ls.set('zeta-key', key);
+  if (params.get('key')) history.replaceState(null, '', '/dashboard' + location.hash);
+  const m = /^zt_(\d+)_/.exec(key);
+  role = m ? 'store' : 'owner'; myStore = m ? Number(m[1]) : null;
+  try { stores = role === 'owner' ? await get('/owner/stores') : []; } catch (e) { loginForm('That key was not accepted: ' + e.message); return; }
+  shell();
+  const want = location.hash.slice(1);
+  go(['overview', 'stores', 'explore', 'ops'].includes(want) && (role === 'owner' || ['overview', 'explore'].includes(want)) ? want : 'overview');
 }
 start();
 </script>

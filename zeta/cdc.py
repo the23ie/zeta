@@ -203,6 +203,7 @@ class Hub(threading.Thread):
         with ThreadPoolExecutor(self.workers) as ex:
             list(ex.map(lambda st: st.bootstrap(), streams))
         self.streams = {st.db: st for st in streams}
+        log.info("owner index: %s", self.engine.build_owner())
 
     def rebuild(self, db=None):
         """B-2: rebuild one store database (or all) from a fresh exported snapshot, others keep streaming."""
@@ -215,6 +216,7 @@ class Hub(threading.Thread):
             new.bootstrap()
             with self.lock:
                 self.streams[d] = new
+        log.info("owner index: %s", self.engine.build_owner())
         return targets
 
     def stream_of(self, tid):
