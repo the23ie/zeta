@@ -41,8 +41,9 @@ def save(engine, stream, root):
     """Checkpoint one store database. Returns ("saved", lsn) after writing, or ("same", lsn) when no data changed
     since the last snapshot: then only markers/heartbeats arrived, the saved state still equals the current
     state, and the position can be confirmed without writing anything."""
+    on_disk = os.path.exists(os.path.join(root, stream.db, "CURRENT"))  # someone may have deleted it
     with engine.lock:  # read both positions together
-        if stream.snapshot_at is not None and stream.data_lsn == stream.snap_data_lsn:
+        if on_disk and stream.snapshot_at is not None and stream.data_lsn == stream.snap_data_lsn:
             return "same", stream.applied_lsn
     t0 = time.time()
     snap = engine.capture(stream)  # consistent copy under the engine lock, no I/O inside it

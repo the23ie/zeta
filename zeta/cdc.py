@@ -91,6 +91,14 @@ def parse_change(line):
     return (kind, table, old or None, new or None)
 
 
+class SlotInUse(RuntimeError):
+    """Another reader (usually a second ZETA on the same stores) holds this database's replication slot."""
+
+    def __init__(self, db):
+        super().__init__(f"{db}: its replication slot is in use by another reader (another ZETA on the same "
+                         f"stores?); stop that one first. Nothing was changed.")
+
+
 class Stream:
     """One store database: its replication slot, snapshot bootstrap and per-store freshness."""
 
@@ -148,7 +156,7 @@ class Stream:
             if slot is None:
                 why = "its replication slot is gone"
             elif slot[0]:
-                why = "its replication slot is still in use"
+                raise SlotInUse(self.db)  # another ZETA follows it: leave its slot and snapshot alone
             elif slot[2] == "lost":
                 why = "Postgres removed WAL the slot needed"
             else:
@@ -183,16 +191,19 @@ class Stream:
             c.execute("ALTER TABLE orders REPLICA IDENTITY FULL")
             c.execute("ALTER TABLE order_items REPLICA IDENTITY FULL")
             row = self._slot(c)  # after a rebuild the old walsender may need a moment to exit
-            if row is not None and not row[0]:
+            if row is not None and row[0]:
+                admin.close()
+                raise SlotInUse(self.db)
+            if row is not None:
                 c.execute("SELECT pg_drop_replication_slot(%s)", (self.slot,))
         admin.close()
-        if self.snap_root:
-            snapshot.drop(self.snap_root, self.db)  # it belongs to the old slot
 
         self.repl = psycopg2.connect(self.dsn, connection_factory=psycopg2.extras.LogicalReplicationConnection)
         self.rcur = self.repl.cursor()
         self.rcur.execute(f"CREATE_REPLICATION_SLOT {self.slot} LOGICAL test_decoding EXPORT_SNAPSHOT")
         _, consistent_point, snapshot_name, _ = self.rcur.fetchone()
+        if self.snap_root:
+            snapshot.drop(self.snap_root, self.db)  # it belonged to the old slot, which is now replaced
         snap = psycopg2.connect(self.dsn)
         snap.set_session(isolation_level="REPEATABLE READ", readonly=True)
         with snap.cursor() as c:
@@ -324,10 +335,30 @@ class Hub(threading.Thread):
         k, n = self.shard  # scale-out: this node follows only its share of the databases
         return [d for d in dbs if shard_of(d, n) == k]
 
+    def _busy_slots(self, dbs, wait=10.0):
+        """Slots of these databases that another reader holds, after giving a just-stopped ZETA `wait` s to let go."""
+        slots = ["zeta_" + re.sub(r"\W", "_", d) for d in dbs]
+        c = psycopg2.connect(f"{self.base_dsn} dbname=postgres")
+        try:
+            deadline = time.time() + wait
+            while True:
+                with c.cursor() as cur:
+                    cur.execute("SELECT slot_name FROM pg_replication_slots WHERE active AND slot_name = ANY(%s)", (slots,))
+                    busy = sorted(r[0] for r in cur.fetchall())
+                if not busy or time.time() > deadline:
+                    return busy
+                time.sleep(0.5)
+        finally:
+            c.close()
+
     def bootstrap(self):
         dbs = self._mine(discover(self.base_dsn, self.spec))
         if not dbs:
             raise RuntimeError(f"no databases match {self.spec!r} (shard {self.shard})")
+        busy = self._busy_slots(dbs)
+        if busy:  # another ZETA follows these stores: touch nothing (its slots and snapshots stay as they are)
+            raise RuntimeError(f"{len(busy)} of {len(dbs)} store databases are already followed by another reader "
+                               f"(e.g. {busy[0]}); is another ZETA running on {self.spec!r}? Nothing was changed.")
         streams = [Stream(self.engine, self.base_dsn, db, self.snap_root) for db in dbs]
         with ThreadPoolExecutor(self.workers) as ex:
             list(ex.map(lambda st: st.start(), streams))
