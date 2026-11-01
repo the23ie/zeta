@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="990" viewBox="0 0 1760 990" font-family="Helvetica, Arial, sans-serif">
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#13293D"/></marker>
+<marker id="art" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1B998B"/></marker>
+<marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#D1495B"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#E8913A"/></marker>
+</defs>
+<rect width="1760" height="990" fill="#FFFFFF"/>
+<text x="40" y="58" font-size="34" fill="#13293D" font-weight="bold" text-anchor="start">ZETA architecture</text>
+<text x="40" y="90" font-size="17" fill="#5B6B79" font-weight="normal" text-anchor="start">Exact, live analytics for 100 store databases: read the database&#x27;s own change log, keep running sums, answer in milliseconds</text>
+<rect x="40" y="125" width="300" height="92" rx="14" fill="#FCEBD9"/>
+<text x="58" y="157.0" font-size="15" fill="#13293D" font-weight="bold" text-anchor="start">Shop customers + store apps</text>
+<text x="58" y="177.25" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">place, update and cancel orders</text>
+<text x="58" y="197.5" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">(normal checkout traffic)</text>
+<path d="M60,280 L60,348 A130.0,12 0 0 0 320,348 L320,280" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<ellipse cx="190.0" cy="280" rx="130.0" ry="12" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<text x="190.0" y="322.0" font-size="16" fill="#13293D" font-weight="bold" text-anchor="middle">t10m_001</text>
+<text x="190.0" y="342.0" font-size="13" fill="#5B6B79" font-weight="normal" text-anchor="middle">store 1 · 2.3M orders</text>
+<path d="M60,408 L60,476 A130.0,12 0 0 0 320,476 L320,408" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<ellipse cx="190.0" cy="408" rx="130.0" ry="12" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<text x="190.0" y="450.0" font-size="16" fill="#13293D" font-weight="bold" text-anchor="middle">t10m_003</text>
+<text x="190.0" y="470.0" font-size="13" fill="#5B6B79" font-weight="normal" text-anchor="middle">store 3</text>
+<path d="M60,557 L60,625 A130.0,12 0 0 0 320,625 L320,557" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<ellipse cx="190.0" cy="557" rx="130.0" ry="12" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<text x="190.0" y="599.0" font-size="16" fill="#13293D" font-weight="bold" text-anchor="middle">t10m_099</text>
+<text x="190.0" y="619.0" font-size="13" fill="#5B6B79" font-weight="normal" text-anchor="middle">store 99</text>
+<path d="M60,688 L60,756 A130.0,12 0 0 0 320,756 L320,688" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<ellipse cx="190.0" cy="688" rx="130.0" ry="12" fill="#FFFFFF" stroke="#13293D" stroke-width="2"/>
+<text x="190.0" y="730.0" font-size="16" fill="#13293D" font-weight="bold" text-anchor="middle">t10m_100</text>
+<text x="190.0" y="750.0" font-size="13" fill="#5B6B79" font-weight="normal" text-anchor="middle">store 100 · 15.6k orders</text>
+<line x1="190" y1="217" x2="190" y2="266" stroke="#E8913A" stroke-width="2.5" marker-end="url(#ara)"/>
+<text x="190" y="528" font-size="26" fill="#5B6B79" font-weight="bold" text-anchor="middle">· · ·</text>
+<text x="40" y="808.0" font-size="14" fill="#13293D" font-weight="bold" text-anchor="start">PostgreSQL · one database per store</text>
+<text x="40" y="826.9" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">orders · order_items · products · customers</text>
+<text x="40" y="845.8" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">every commit is written to its WAL</text>
+<text x="40" y="872" font-size="13" fill="#5B6B79" font-weight="normal" text-anchor="start" font-style="italic">(1M run: 10 databases · 10M run: 100)</text>
+<line x1="322" y1="314" x2="488" y2="314" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="322" y1="442" x2="488" y2="442" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="322" y1="591" x2="488" y2="591" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="322" y1="722" x2="488" y2="722" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<rect x="352" y="160" width="122" height="118" rx="14" fill="#FFFFFF"/>
+<text x="413" y="183" font-size="13" fill="#1B998B" font-weight="bold" text-anchor="middle">WAL → ZETA</text>
+<text x="413" y="200" font-size="13" fill="#1B998B" font-weight="normal" text-anchor="middle">logical</text>
+<text x="413" y="217" font-size="13" fill="#1B998B" font-weight="normal" text-anchor="middle">replication,</text>
+<text x="413" y="234" font-size="13" fill="#1B998B" font-weight="normal" text-anchor="middle">1 slot per DB</text>
+<text x="413" y="251" font-size="13" fill="#1B998B" font-weight="normal" text-anchor="middle">+ heartbeat</text>
+<line x1="488" y1="870" x2="330" y2="870" stroke="#D1495B" stroke-width="2" marker-end="url(#arc)" stroke-dasharray="7 6"/>
+<text x="410" y="893" font-size="13" fill="#D1495B" font-weight="normal" text-anchor="middle">audit reads at a snapshot</text>
+<rect x="490" y="125" width="690" height="500" rx="18" fill="#F7FBFB" stroke="#1B998B" stroke-width="2"/>
+<text x="512" y="160" font-size="22" fill="#13293D" font-weight="bold" text-anchor="start">ZETA node 0</text>
+<text x="1160" y="160" font-size="14" fill="#5B6B79" font-weight="normal" text-anchor="end">follows stores 1, 3, 5, … (its share of the databases)</text>
+<rect x="512" y="182" width="150" height="92" rx="14" fill="#DDF2EF"/>
+<text x="587" y="214" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">CDC hub</text>
+<text x="587" y="233" font-size="14" fill="#13293D" font-weight="normal" text-anchor="middle">one thread,</text>
+<text x="587" y="252" font-size="14" fill="#13293D" font-weight="normal" text-anchor="middle">select over slots</text>
+<line x1="662" y1="228" x2="698" y2="228" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<rect x="700" y="182" width="170" height="92" rx="14" fill="#DDF2EF"/>
+<text x="785" y="214" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">Z-set apply</text>
+<text x="785" y="233" font-size="14" fill="#13293D" font-weight="normal" text-anchor="middle">+new row  −old row</text>
+<text x="785" y="252" font-size="14" fill="#13293D" font-weight="normal" text-anchor="middle">(cancel = move)</text>
+<line x1="870" y1="228" x2="906" y2="228" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<rect x="908" y="182" width="250" height="92" rx="14" fill="#1B998B"/>
+<text x="1033" y="214" font-size="14" fill="#FFFFFF" font-weight="bold" text-anchor="middle">In-memory state</text>
+<text x="1033" y="233" font-size="14" fill="#FFFFFF" font-weight="normal" text-anchor="middle">exact, updated per commit</text>
+<text x="1033" y="252" font-size="14" fill="#FFFFFF" font-weight="normal" text-anchor="middle">≈ 3 GB for 10M orders</text>
+<rect x="512" y="296" width="646" height="150" rx="12" fill="#FFFFFF" stroke="#C9D6DE" stroke-width="1.5"/>
+<text x="532" y="326" font-size="14" fill="#13293D" font-weight="bold" text-anchor="start">Per store: Fenwick trees (running sums)</text>
+<text x="532" y="347" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">hour × status → [count, revenue]   ·   day × product → [sales]</text>
+<text x="532" y="368" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">any range = ~log n reads, not a scan of millions of rows</text>
+<text x="532" y="398" font-size="14" fill="#13293D"><tspan font-weight="bold">Row mirror</tspan>: exact partial-hour edges (09:37 → 14:12)</text>
+<text x="532" y="421" font-size="14" fill="#13293D"><tspan font-weight="bold">Owner index</tspan>: the same sums for all its stores together</text>
+<rect x="512" y="466" width="206" height="96" rx="14" fill="#EEF3F6"/>
+<text x="528" y="496" font-size="14" fill="#13293D" font-weight="bold" text-anchor="start">Audit</text>
+<text x="528" y="516" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">compare with DB at a</text>
+<text x="528" y="536" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">snapshot → fix one hour</text>
+<rect x="732" y="466" width="206" height="96" rx="14" fill="#EEF3F6"/>
+<text x="748" y="496" font-size="14" fill="#13293D" font-weight="bold" text-anchor="start">Checkpoints</text>
+<text x="748" y="516" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">state + WAL position</text>
+<text x="748" y="536" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">restart in ~2 s</text>
+<rect x="952" y="466" width="206" height="96" rx="14" fill="#EEF3F6"/>
+<text x="968" y="496" font-size="14" fill="#13293D" font-weight="bold" text-anchor="start">Guard</text>
+<text x="968" y="516" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">HMAC keys per store,</text>
+<text x="968" y="536" font-size="14" fill="#13293D" font-weight="normal" text-anchor="start">rate + concurrency caps</text>
+<text x="512" y="600" font-size="14" fill="#5B6B79" font-weight="normal" text-anchor="start">API: /tenants/{id}/…  ·  /owner/…  ·  /analytics/…  ·  /admin/…  ·  /dashboard  ·  /store</text>
+<rect x="490" y="650" width="690" height="150" rx="18" fill="#F7FBFB" stroke="#1B998B" stroke-width="2"/>
+<text x="512" y="686" font-size="22" fill="#13293D" font-weight="bold" text-anchor="start">ZETA node 1</text>
+<text x="1160" y="686" font-size="14" fill="#5B6B79" font-weight="normal" text-anchor="end">follows stores 2, 4, 6, …</text>
+<rect x="512" y="708" width="104" height="46" rx="10" fill="#DDF2EF"/>
+<text x="564.0" y="737" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">CDC hub</text>
+<rect x="630" y="708" width="116" height="46" rx="10" fill="#DDF2EF"/>
+<text x="688.0" y="737" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">Z-set apply</text>
+<rect x="760" y="708" width="146" height="46" rx="10" fill="#DDF2EF"/>
+<text x="833.0" y="737" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">Fenwick + mirror</text>
+<rect x="920" y="708" width="116" height="46" rx="10" fill="#DDF2EF"/>
+<text x="978.0" y="737" font-size="14" fill="#13293D" font-weight="bold" text-anchor="middle">Owner index</text>
+<text x="512" y="780" font-size="14" fill="#5B6B79" font-weight="normal" text-anchor="start">same pipeline · audit · checkpoints · guard</text>
+<rect x="1060" y="708" width="98" height="46" rx="10" fill="#FFFFFF" stroke="#C9D6DE" stroke-width="1.5"/>
+<text x="1109" y="737" font-size="14" fill="#5B6B79" font-weight="bold" text-anchor="middle">node N…</text>
+<text x="835" y="832" font-size="14" fill="#5B6B79" font-weight="normal" text-anchor="middle" font-style="italic">nodes scale out: each node holds only its share of the stores</text>
+<rect x="1230" y="125" width="230" height="675" rx="18" fill="#13293D"/>
+<text x="1250" y="290" font-size="16" fill="#FFFFFF" font-weight="bold" text-anchor="start">Router  :8001</text>
+<text x="1250" y="313" font-size="16" fill="#FFFFFF" font-weight="normal" text-anchor="start">one front door,</text>
+<text x="1250" y="336" font-size="16" fill="#FFFFFF" font-weight="normal" text-anchor="start">holds no data</text>
+<text x="1250" y="384" font-size="15" fill="#FFFFFF" font-weight="bold" text-anchor="start">Store key</text>
+<text x="1250" y="405" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">→ only the node</text>
+<text x="1250" y="426" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">holding that store</text>
+<text x="1250" y="470" font-size="15" fill="#FFFFFF" font-weight="bold" text-anchor="start">Owner key</text>
+<text x="1250" y="491" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">→ every node at once,</text>
+<text x="1250" y="512" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">answers merged exactly:</text>
+<text x="1250" y="533" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">sums · trends by bucket</text>
+<text x="1250" y="554" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">top-N re-ranked</text>
+<text x="1250" y="575" font-size="15" fill="#FFFFFF" font-weight="normal" text-anchor="start">ratios recomputed</text>
+<line x1="1228" y1="350" x2="1184" y2="350" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="1184" y1="370" x2="1228" y2="370" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="1228" y1="716" x2="1184" y2="716" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<line x1="1184" y1="736" x2="1228" y2="736" stroke="#1B998B" stroke-width="2.5" marker-end="url(#art)"/>
+<rect x="1510" y="200" width="220" height="118" rx="14" fill="#FCEBD9"/>
+<text x="1528" y="234" font-size="15" fill="#13293D" font-weight="bold" text-anchor="start">Owner dashboard</text>
+<text x="1528" y="256" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">all 100 stores, KPIs,</text>
+<text x="1528" y="278" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">explore, operations</text>
+<line x1="1508" y1="259" x2="1462" y2="259" stroke="#13293D" stroke-width="2.5" marker-end="url(#ar)"/>
+<rect x="1510" y="360" width="220" height="118" rx="14" fill="#DDF2EF"/>
+<text x="1528" y="394" font-size="15" fill="#13293D" font-weight="bold" text-anchor="start">Store dashboards</text>
+<text x="1528" y="416" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">each store sees</text>
+<text x="1528" y="438" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">only its own data</text>
+<line x1="1508" y1="419" x2="1462" y2="419" stroke="#13293D" stroke-width="2.5" marker-end="url(#ar)"/>
+<rect x="1510" y="520" width="220" height="118" rx="14" fill="#EEF3F6"/>
+<text x="1528" y="554" font-size="15" fill="#13293D" font-weight="bold" text-anchor="start">API clients</text>
+<text x="1528" y="576" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">/tenants · /owner</text>
+<text x="1528" y="598" font-size="15" fill="#13293D" font-weight="normal" text-anchor="start">/analytics</text>
+<line x1="1508" y1="579" x2="1462" y2="579" stroke="#13293D" stroke-width="2.5" marker-end="url(#ar)"/>
+<rect x="40" y="920" width="1690" height="48" rx="10" fill="#EEF3F6"/>
+<text x="60" y="951" font-size="15" fill="#13293D" font-weight="bold" text-anchor="start">docker compose up  →  postgres · loader (data) · zeta, or node0 + node1 + router · store app</text>
+<text x="1710" y="951" font-size="15" fill="#1B998B" font-weight="bold" text-anchor="end">10M orders · 100 DBs · queries 1–6 ms · visible in ~10 ms · 600/600 exact</text>
+</svg>
