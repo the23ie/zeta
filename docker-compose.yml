@@ -1,0 +1,117 @@
+# ZETA in Docker: Postgres (one database per store) + data loader + ZETA.
+#   docker compose up --build                          1M orders, 10 stores, one ZETA node   -> http://localhost:8000
+#   DATASET=10m docker compose up --build              10M orders, 100 stores (needs ~8 GB for Docker)
+#   COMPOSE_PROFILES=cluster docker compose up         2 ZETA nodes + router on the same port
+#   COMPOSE_PROFILES=single,store docker compose up    plus the demo customer store on :9000
+#   docker compose exec zeta keys 7                    store 7's key + owner and admin keys (use `router` in cluster mode)
+# Data, snapshots and the key secret live in named volumes; `docker compose down -v` deletes them.
+# Switching between single and cluster: `docker compose down` first (each store database has one replication slot).
+
+name: zeta
+
+x-app: &app
+  image: zeta:local       # built once by the loader service
+  pull_policy: never
+  volumes:
+    - state:/state
+    - data:/data
+  environment: &env
+    DATASET: ${DATASET:-1m}
+    ZETA_PG: host=postgres port=5432 user=zeta
+    STORE_PG: host=postgres port=5432 user=zeta
+    ZETA_DBS: t${DATASET:-1m}_*
+    STORE_DBS: t${DATASET:-1m}_*
+    ZETA_SECRET_FILE: /state/.zeta_secret
+    ZETA_KEY_VERSIONS: /state/key_versions.json
+    ZETA_SNAPSHOT_DIR: /state/snapshots
+
+x-zeta: &zeta
+  <<: *app
+  restart: unless-stopped
+  depends_on:
+    loader:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: zeta
+      POSTGRES_DB: zeta
+      POSTGRES_HOST_AUTH_METHOD: trust   # local demo only: not reachable from outside this machine (see ports)
+    command: >
+      postgres -c wal_level=logical -c track_commit_timestamp=on
+      -c max_replication_slots=256 -c max_wal_senders=256 -c max_connections=1000
+      -c synchronous_commit=off -c wal_writer_delay=10ms
+      -c shared_buffers=512MB -c work_mem=64MB -c maintenance_work_mem=512MB
+      -c max_wal_size=8GB -c checkpoint_timeout=30min -c max_slot_wal_keep_size=20GB
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:${PG_PORT:-5434}:5432"   # psql -h localhost -p 5434 -U zeta t1m_001
+    volumes:
+      - pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "zeta"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  loader:   # runs once: creates the key secret, generates the dataset and loads one database per store (skipped if loaded)
+    <<: *app
+    build: .
+    pull_policy: build
+    command: load
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  zeta:     # one ZETA node following every store database
+    <<: *zeta
+    profiles: [single]
+    command: node
+    ports:
+      - "${ZETA_PORT:-8000}:8000"
+
+  node0:    # cluster: each node follows half of the store databases
+    <<: *zeta
+    profiles: [cluster]
+    command: node
+    environment:
+      <<: *env
+      ZETA_SHARD: 0/2
+
+  node1:
+    <<: *zeta
+    profiles: [cluster]
+    command: node
+    environment:
+      <<: *env
+      ZETA_SHARD: 1/2
+
+  router:   # cluster: the one address; store requests go to the node holding the store, owner answers are added up
+    <<: *zeta
+    profiles: [cluster]
+    command: router
+    environment:
+      <<: *env
+      ZETA_NODES: http://node0:8000,http://node1:8000
+    depends_on:
+      - node0
+      - node1
+    ports:
+      - "${ZETA_PORT:-8000}:8000"
+
+  store:    # optional demo customer store: place and cancel orders in any shop's database
+    <<: *app
+    profiles: [store]
+    command: store
+    depends_on:
+      loader:
+        condition: service_completed_successfully
+    ports:
+      - "${STORE_PORT:-9000}:9000"
+
+volumes:
+  pg:
+  state:
+  data:

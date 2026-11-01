@@ -22,8 +22,8 @@ import threading
 import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SECRET_FILE = os.path.join(_ROOT, ".zeta_secret")
-_VERSIONS_FILE = os.path.join(_ROOT, ".zeta_key_versions.json")
+_SECRET_FILE = os.environ.get("ZETA_SECRET_FILE", os.path.join(_ROOT, ".zeta_secret"))
+_VERSIONS_FILE = os.environ.get("ZETA_KEY_VERSIONS", os.path.join(_ROOT, ".zeta_key_versions.json"))
 # ZETA_SECRET, else the project's .zeta_secret file, else a dev default (anyone with the code can mint keys)
 SECRET = (os.environ.get("ZETA_SECRET")
           or (open(_SECRET_FILE).read().strip() if os.path.exists(_SECRET_FILE) else "zeta-dev-secret")).encode()

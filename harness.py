@@ -227,7 +227,7 @@ def pct(xs, p):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dbs", default="t1m_*", help="store databases: prefix pattern or comma list")
+    ap.add_argument("--dbs", default=os.environ.get("ZETA_DBS", "t1m_*"), help="store databases: prefix pattern or comma list (default: $ZETA_DBS)")
     ap.add_argument("--api", default="http://localhost:8000")
     ap.add_argument("--n", type=int, default=1000, help="store checks")
     ap.add_argument("--owner-n", type=int, default=None, help="owner checks (default n/5)")

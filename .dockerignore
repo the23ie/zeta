@@ -1,0 +1,11 @@
+.git
+.venv
+pgdata
+data_*
+snapshots
+logs
+__pycache__
+.zeta_secret
+.zeta_key_versions.json
+.DS_Store
+*.log

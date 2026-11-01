@@ -54,11 +54,15 @@ owns all stores. It can also prove that its totals match the databases. [V] (`ze
 | `.venv/` (not in git) | Python virtual environment, 212 MB | [V] |
 | `.zeta_secret` (not in git) | Secret that signs all API keys | [V] |
 
-`requirements.txt` (version ranges), `requirements.lock` (exact tested versions) and `setup.sh` (one command) exist;
-there is no Dockerfile and no unit-test suite. The automated pass/fail tests are `harness.py` (correctness) and
+`requirements.txt` (version ranges), `requirements.lock` (exact tested versions), `setup.sh` (one command) and a
+Docker Compose setup (`docker-compose.yml`, `Dockerfile`: Postgres + loader + ZETA single node or 2 nodes + router)
+exist; there is no unit-test suite. The automated pass/fail tests are `harness.py` (correctness) and
 `test_isolation.py` (isolation). [V]
 
 ### How to start it from scratch
+
+With Docker: `docker compose up --build -d`, then `docker compose logs loader` for the keys (README "Quick start"). [V]
+Without Docker:
 
 ```bash
 brew install python postgresql@15      # Python 3.11+, PostgreSQL 15+

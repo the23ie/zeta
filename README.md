@@ -45,10 +45,42 @@ own queries and the owner's cross-store queries from memory, exactly.
 | `simulate.py` | Write traffic across the store databases (inserts, status changes, old cancellations, deletes, items, backdates) |
 | `demo_live.py` | Judge demo: one store's customers place and cancel orders; store + owner numbers vs SQL at every step |
 | `bench.py` | Benchmarks: latency + growth 1M vs 10M (store and owner), freshness, DB safety |
+| `docker-compose.yml`, `Dockerfile`, `docker/entrypoint.sh` | Docker: Postgres + loader + ZETA (single node or cluster) + optional store app |
 | `setup.sh`, `requirements.txt`, `requirements.lock`, `env.sh` | One-command setup; Python dependencies (ranges / exact tested versions); shared settings (Postgres port, data dir) |
 | `run.sh`, `run_cluster.sh`, `run_store.sh`, `keys.sh` | Start ZETA (one node / several nodes + router) / the store app; print keys |
 
-## Setup (one command)
+## Quick start with Docker (nothing else to install)
+
+Needs Docker Desktop (give it 8 GB of memory for the 10M dataset).
+
+```bash
+docker compose up --build -d                    # Postgres + data loader + ZETA, 1M orders / 10 stores  (~1 min)
+docker compose logs loader                      # shows the owner key, admin key and store 1's key
+open "http://localhost:8000/dashboard?key=<owner key>"
+docker compose exec zeta keys 7                 # store 7's key -> http://localhost:8000/store?key=<it>
+```
+
+| Want | Command |
+|---|---|
+| 10M orders, 100 stores (main run) | `DATASET=10m docker compose up -d` |
+| 2 ZETA nodes + router (scale-out), same port | `docker compose down && COMPOSE_PROFILES=cluster docker compose up -d` |
+| also the demo customer store on :9000 | add `store` to the profiles, e.g. `COMPOSE_PROFILES=single,store` |
+| check correctness / isolation inside Docker | `docker compose exec zeta python harness.py --api http://localhost:8000 --n 500 --mutate 300` and `... test_isolation.py --api http://localhost:8000` (`router` instead of `zeta` in cluster mode) |
+| look at the data | `psql -h localhost -p 5434 -U zeta t1m_001` |
+| stop / delete everything | `docker compose down` / `docker compose down -v` (also deletes data, snapshots and the key secret) |
+
+Services: `postgres` (Postgres 15 with ZETA's settings), `loader` (runs once: key secret, data generation, one
+database per store; skipped when already loaded), `zeta` (one node) or `node0` + `node1` + `router` (cluster
+profile), `store` (optional). Data, snapshots and the key secret are in named volumes, so a restart resumes from
+snapshots instead of reloading. Tested here (Docker Desktop, 8 GB, Apple M4):
+
+| Run | Result |
+|---|---|
+| 1M, one node | first start ~1 min including data; 600/600 checks match SQL, 246 isolation checks, 0 failures |
+| 1M, 2 nodes + router | 600/600 and 246/0 through the router; store app up |
+| 10M, one node | data generated + loaded into 100 databases in 3 min; first ZETA load 23 s, restart from snapshots 2.9 s; 600/600 checks (100 owner checks across 100 databases), 246/0 isolation; ZETA uses 3 GB, Postgres 1 GB |
+
+## Setup without Docker (one command)
 
 Needs Python 3.11+ and PostgreSQL 15+ (macOS: `brew install python postgresql@15`). Then:
 
@@ -270,7 +302,7 @@ Results there: 1000/1000 correctness on 1M and 10M after live writes; store quer
 Implementation notes vs the design doc:
 - `test_decoding` instead of `wal2json` (ships with Postgres, nothing to install; same information: old row via `REPLICA IDENTITY FULL`, xids, commit timestamps)
 - Mirror is in-memory numpy (sorted columns + CSR items) instead of SQLite: edges are a `searchsorted` + `bincount`
-- Native Postgres instead of docker-compose (Docker daemon was not running)
+- Native Postgres for development; Docker Compose (see Quick start) for running it anywhere
 
 ## Still open
 
