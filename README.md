@@ -284,27 +284,3 @@ Half the dashboard refreshes are a store's own numbers, half are the owner's all
 
 Direct SQL for an owner dashboard also needs a connection to every store database per user (100 per user here),
 which exhausted Postgres's default connection limit; ZETA needs one replication connection per store database in total.
-
-### Isolation + limits
-
-- Store key → only its own store (other store → 403); owner key → all stores and `/owner/*`; no / forged key → 401
-- Cost-aware per-store token buckets by tier (429 + `Retry-After`); the owner has its own larger bucket
-- At most a few queries **at the same time** per store (starter 2, growth 4, enterprise 8, owner 16); more get 429
-  with `Retry-After: 0.2` (the dashboards retry). 24 parallel heavy trend queries: a starter store got 7 answered and
-  17 refused, an enterprise store 14 and 10, so one store cannot take every worker
-
-## Earlier checkpoints (single shared database, superseded)
-
-Checkpoint 1 (31 Oct, 5 pm) and checkpoint 2 used one shared database with `tenant_id` (`zeta`, `zeta10m`).
-Results there: 1000/1000 correctness on 1M and 10M after live writes; store queries 0.5–1.1 ms at 10M with
-1.00–1.34× growth; freshness 8 ms p50; app latency unchanged with dashboards on ZETA. Those numbers are kept in git history.
-
-Implementation notes vs the design doc:
-- `test_decoding` instead of `wal2json` (ships with Postgres, nothing to install; same information: old row via `REPLICA IDENTITY FULL`, xids, commit timestamps)
-- Mirror is in-memory numpy (sorted columns + CSR items) instead of SQLite: edges are a `searchsorted` + `bincount`
-- Native Postgres for development; Docker Compose (see Quick start) for running it anywhere
-
-## Still open
-
-- Owner top-N edge cost follows orders per day (3.9× from 1M to 10M, 6 ms); fix: hourly per-product subtotals
-- B-4 `metrics.yaml` validator (reject non-invertible aggregates)
